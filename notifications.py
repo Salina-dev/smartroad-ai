@@ -6,10 +6,12 @@ Provides alert functionality for Live Camera Detection:
 - Deduplication (30 sec per damage type)
 - Optional sound alert via HTML/JS
 - Optional browser notification via HTML/JS Notification API
+- Debug logging for troubleshooting
 """
 import datetime
 import time
 import streamlit as st
+from streamlit.components.v1 import html
 
 
 # Deduplication: track last alert time per damage type (e.g. "Pothole", "Crack")
@@ -35,6 +37,33 @@ def _extract_damage_type(label: str) -> str:
         return "Crack"
     # Any other road damage label
     return label
+
+
+def init_notification_system():
+    """Call once on page load to request notification permission and warm up AudioContext."""
+    init_js = """
+    <script>
+    (function() {
+        // Request notification permission silently
+        if ("Notification" in window && Notification.permission === "default") {
+            Notification.requestPermission().then(function(perm) {
+                console.log("[SmartRoad] Notification permission:", perm);
+            });
+        }
+        // Pre-warm AudioContext (must be from user gesture, but this helps)
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            if (ctx.state === "suspended") {
+                ctx.resume();
+            }
+            console.log("[SmartRoad] AudioContext initialized, state:", ctx.state);
+        } catch(e) {
+            console.warn("[SmartRoad] AudioContext init:", e);
+        }
+    })();
+    </script>
+    """
+    html(init_js, height=0)
 
 
 def check_detections(
@@ -64,17 +93,27 @@ def check_detections(
     enable_browser_notify : bool
         If True, injects JS to show a browser notification.
     """
+    if not detections:
+        print("[alerts] No detections to process.")
+        return
+
+    print(f"[alerts] Processing {len(detections)} detection(s)...")
+    triggered_count = 0
+
     for item in detections:
         confidence = item.get("confidence", 0)
         if confidence < conf_threshold:
+            print(f"[alerts] Skipping {item.get('label','?')}: confidence {confidence:.2f} < threshold {conf_threshold}")
             continue
 
         label = item.get("label", "Unknown")
         damage_type = _extract_damage_type(label)
         if not damage_type:
+            print(f"[alerts] Skipping: could not extract damage type from '{label}'")
             continue
 
         if not _should_alert(damage_type):
+            print(f"[alerts] Skipping {damage_type}: within cooldown period")
             continue
 
         confidence_pct = round(confidence * 100, 1)
@@ -93,14 +132,21 @@ def check_detections(
             f"**Time:** {now_str}"
         )
         st.warning(alert_msg)
+        print(f"[alerts] Streamlit alert triggered: {damage_type} @ {confidence_pct}%")
 
         # --- Optional sound alert ---
         if enable_sound:
             _play_alert_sound()
+            print(f"[alerts] Sound alert triggered for {damage_type}")
 
         # --- Optional browser notification ---
         if enable_browser_notify:
             _show_browser_notification(damage_type, confidence_pct, location_str, now_str)
+            print(f"[alerts] Browser notification triggered for {damage_type}")
+
+        triggered_count += 1
+
+    print(f"[alerts] Total alerts triggered: {triggered_count}")
 
 
 def _play_alert_sound():
@@ -110,6 +156,10 @@ def _play_alert_sound():
     (function() {
         try {
             var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            if (ctx.state === "suspended") {
+                ctx.resume();
+            }
+            // Play a short alert beep
             var osc = ctx.createOscillator();
             var gain = ctx.createGain();
             osc.connect(gain);
@@ -120,13 +170,14 @@ def _play_alert_sound():
             gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
             osc.start(ctx.currentTime);
             osc.stop(ctx.currentTime + 0.3);
+            console.log("[SmartRoad] Beep sound played at", new Date().toLocaleTimeString());
         } catch(e) {
-            console.warn('Alert sound not available:', e);
+            console.warn('[SmartRoad] Alert sound error:', e);
         }
     })();
     </script>
     """
-    st.components.v1.html(sound_html, height=0)
+    html(sound_html, height=0)
 
 
 def _show_browser_notification(damage_type: str, confidence_pct: float, location: str, timestamp: str):
@@ -134,31 +185,49 @@ def _show_browser_notification(damage_type: str, confidence_pct: float, location
     notify_html = f"""
     <script>
     (function() {{
+        console.log("[SmartRoad] Attempting browser notification: {damage_type} @ {confidence_pct}%");
         if (!("Notification" in window)) {{
-            console.warn("Browser notifications not supported.");
+            console.warn("[SmartRoad] Browser notifications not supported.");
             return;
         }}
         if (Notification.permission === "granted") {{
-            new Notification("⚠️ ROAD DAMAGE ALERT", {{
-                body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLoc: {location}\\nTime: {timestamp}",
-                icon: ""
-            }});
+            try {{
+                var n = new Notification("⚠️ ROAD DAMAGE ALERT", {{
+                    body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLoc: {location}\\nTime: {timestamp}",
+                    icon: ""
+                }});
+                console.log("[SmartRoad] Notification sent successfully");
+                // Auto-close after 5 seconds
+                setTimeout(function() {{ n.close(); }}, 5000);
+            }} catch(e) {{
+                console.warn("[SmartRoad] Notification error:", e);
+            }}
         }} else if (Notification.permission !== "denied") {{
             Notification.requestPermission().then(function(permission) {{
+                console.log("[SmartRoad] Permission result:", permission);
                 if (permission === "granted") {{
-                    new Notification("⚠️ ROAD DAMAGE ALERT", {{
-                        body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLoc: {location}\\nTime: {timestamp}",
-                        icon: ""
-                    }});
+                    try {{
+                        var n = new Notification("⚠️ ROAD DAMAGE ALERT", {{
+                            body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLoc: {location}\\nTime: {timestamp}",
+                            icon: ""
+                        }});
+                        console.log("[SmartRoad] Notification sent after permission grant");
+                        setTimeout(function() {{ n.close(); }}, 5000);
+                    }} catch(e) {{
+                        console.warn("[SmartRoad] Notification error:", e);
+                    }}
                 }}
             }});
+        }} else {{
+            console.warn("[SmartRoad] Notification permission denied");
         }}
     }})();
     </script>
     """
-    st.components.v1.html(notify_html, height=0)
+    html(notify_html, height=0)
 
 
 def reset_dedup():
     """Clear all deduplication tracking (useful when starting a new session)."""
     _last_alert_times.clear()
+    print("[alerts] Dedup cache cleared")
