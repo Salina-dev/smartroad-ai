@@ -12,6 +12,7 @@ from streamlit_js_eval import get_geolocation
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
 
+
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -1193,16 +1194,15 @@ def live_detection_page():
             st.markdown('</div>', unsafe_allow_html=True)
 
         # ========== DETECTION LOOP ==========
-        cap = cv2.VideoCapture(stream_url if stream_url else 0)
-        if not cap.isOpened():
-            st.error("Unable to open camera stream.")
-            st.session_state.live_inspection_active = False
-            st.session_state.live_camera_running = False
-            st.session_state.live_camera_status = "❌ Error"
-            return
-
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_width)
+        webrtc_streamer(
+            key="road-camera",
+            media_stream_constrains={
+                "video": True,
+                "audio": False, 
+            }
+        )
+        st.sucess("Camera component loaded")
+        return
 
         frame_count = 0
 
@@ -1212,35 +1212,6 @@ def live_detection_page():
         except (ValueError, TypeError):
             alert_lat, alert_lon = 0.0, 0.0
 
-        # Continuous loop - NO max_frames limit, runs until user stops
-        while cap.isOpened() and st.session_state.live_inspection_active:
-            ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.03)
-                continue
-
-            frame_count += 1
-            st.session_state.live_stats["total_frames"] += 1
-
-            # Run detection on every nth frame
-            if frame_count % frame_skip == 0:
-                detections = detector.detect_frame(frame, conf=0.15, imgsz=640, resize_max=capture_width)
-                st.session_state.live_stats["last_detections"] = detections
-            else:
-                detections = st.session_state.live_stats["last_detections"]
-
-            if detections:
-                # Draw detections on frame
-                frame = detector.draw_detections(frame, detections)
-
-                # Update statistics
-                for item in detections:
-                    if item["label"] == "Pothole":
-                        st.session_state.live_stats["total_potholes"] += 1
-                    if "Crack" in item["label"]:
-                        st.session_state.live_stats["total_cracks"] += 1
-                    if item["severity"] in ("Critical", "High"):
-                        st.session_state.live_stats["critical_damages"] += 1
 
                 # --- Save screenshot for EVERY detection ---
                 snap_path = Path("uploads") / f"live_snap_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{st.session_state.live_stats['total_detections']+1}.jpg"
