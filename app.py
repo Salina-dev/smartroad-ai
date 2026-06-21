@@ -1486,19 +1486,26 @@ def live_detection_page():
             """, unsafe_allow_html=True)
 
             # WebRTC Stream
-            ctx = webrtc_streamer(
+            camera_option = st.selectbox(
+    "Select Camera",
+    ["Back Camera", "Front Camera"]
+)
+
+facing_mode = "environment" if camera_option == "Back Camera" else "user"
+
+ctx = webrtc_streamer(
     key="road-camera",
     video_processor_factory=RoadDamageVideoProcessor,
     media_stream_constraints={
         "video": {
-            "facingMode": "environment"
+            "facingMode": facing_mode
         },
         "audio": False
     }
 )
 
-            if ctx.video_processor:
-                st.markdown("<div class='cam-status-active'><span style='color:#22C55E;font-size:1.2rem;'>●</span><span style='color:#111827;font-size:0.85rem;font-weight:600;'>Camera feed active — road damage detection running in real-time</span></div>", unsafe_allow_html=True)
+if ctx.video_processor:
+               st.markdown("<div class='cam-status-active'><span style='color:#22C55E;font-size:1.2rem;'>●</span><span style='color:#111827;font-size:0.85rem;font-weight:600;'>Camera feed active — road damage detection running in real-time</span></div>", unsafe_allow_html=True)
             else:
                 st.markdown("<div class='cam-status-waiting'><span style='color:#2563EB;font-size:1rem;'>ℹ️</span><span style='color:#6B7280;font-size:0.85rem;'>Click <strong>START</strong> on the WebRTC panel to begin streaming</span></div>", unsafe_allow_html=True)
 
