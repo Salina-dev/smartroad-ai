@@ -1,0 +1,325 @@
+import sqlite3
+import datetime
+import hashlib
+from pathlib import Path
+import bcrypt
+import json
+
+
+# Password helpers using the bcrypt library
+def _prepare_password(password: str) -> bytes:
+    """Return a UTF-8 encoded password-safe value for bcrypt.
+
+    If the UTF-8 encoded password is longer than 72 bytes, return the
+    SHA256 hex digest (encoded) so bcrypt receives a consistent short value.
+    """
+    if password is None:
+        password = ""
+    pw_bytes = password.encode("utf-8", errors="surrogatepass")
+    if len(pw_bytes) > 72:
+        # use hex digest (ASCII) which is well under 72 bytes
+        return hashlib.sha256(pw_bytes).hexdigest().encode("utf-8")
+    return pw_bytes
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt, safe for passwords >72 bytes."""
+    pw = _prepare_password(password)
+    hashed = bcrypt.hashpw(pw, bcrypt.gensalt())
+    return hashed.decode("utf-8")
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    """Verify a password against a bcrypt hash."""
+    try:
+        pw = _prepare_password(password)
+        return bcrypt.checkpw(pw, hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+class Database:
+    def __init__(self, db_path):
+        self.db_path = Path(db_path)
+        self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
+        self.cursor = self.connection.cursor()
+
+    def initialize(self):
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                full_name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE,
+                mobile TEXT,
+                department TEXT,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                filename TEXT,
+                media_type TEXT,
+                location_country TEXT,
+                location_state TEXT,
+                location_city TEXT,
+                location_area TEXT,
+                created_at TEXT,
+                location_road_name TEXT,
+                total_potholes INTEGER,
+                total_cracks INTEGER,
+                critical_damages INTEGER,
+                average_confidence REAL,
+                detections_json TEXT,
+                updated_at TEXT,
+                condition_score INTEGER,
+                latitude TEXT,
+                longitude TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS locations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                country TEXT,
+                state TEXT,
+                district TEXT,
+                city TEXT,
+                area TEXT,
+                road_name TEXT,
+                latitude TEXT,
+                longitude TEXT,
+                created_at TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+            """
+        )
+        # Per-detection events (one row per detected damage instance)
+        self.cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS detection_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                detection_time TEXT NOT NULL,
+                label TEXT,
+                confidence REAL,
+                bbox TEXT,
+                latitude TEXT,
+                longitude TEXT,
+                location_country TEXT,
+                location_state TEXT,
+                location_district TEXT,
+                location_city TEXT,
+                location_area TEXT,
+                location_road_name TEXT,
+                screenshot_path TEXT,
+                source TEXT,
+                UNIQUE(user_id, detection_time, label, latitude, longitude)
+            )
+            """
+        )
+        # Indexes for performance
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_events_user_time ON detection_events(user_id, detection_time)")
+        self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_detection_events_label ON detection_events(label)")
+        
+        # Ensure 'source' column exists in detection_events (Migration)
+        try:
+            self.cursor.execute("ALTER TABLE detection_events ADD COLUMN source TEXT")
+        except sqlite3.OperationalError:
+            pass
+
+        # Ensure 'severity' column exists in detection_events (Migration)
+        try:
+            self.cursor.execute("ALTER TABLE detection_events ADD COLUMN severity TEXT DEFAULT 'Low'")
+        except sqlite3.OperationalError:
+            pass
+
+        # Ensure 'district' column exists in detections (Migration)
+        try:
+            self.cursor.execute("ALTER TABLE detections ADD COLUMN location_district TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+
+        # Ensure 'severity' column exists in detections (Migration)
+        try:
+            self.cursor.execute("ALTER TABLE detections ADD COLUMN severity TEXT DEFAULT 'Low'")
+        except sqlite3.OperationalError:
+            pass
+
+        self.connection.commit()
+
+    def create_user(self, full_name, email, mobile, department, password):
+        pw = str(password or "")
+        password_hash = hash_password(pw)
+        self.cursor.execute(
+            "INSERT INTO users (full_name, email, mobile, department, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (full_name, email, mobile, department, password_hash, datetime.datetime.now().isoformat()),
+        )
+        self.connection.commit()
+
+    def get_user_by_email(self, email):
+        self.cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+        return self.cursor.fetchone()
+
+    def verify_password(self, password, password_hash):
+        try:
+            pw = str(password or "")
+            return verify_password(pw, password_hash)
+        except Exception:
+            return False
+
+    def add_detection_record(
+        self,
+        user_id,
+        filename,
+        media_type,
+        location_country,
+        location_state,
+        location_city,
+        location_area,
+        location_road_name,
+        latitude,
+        longitude,
+        total_potholes,
+        total_cracks,
+        critical_damages,
+        average_confidence,
+        condition_score,
+        detections_json,
+    ):
+        self.cursor.execute(
+            "INSERT INTO detections (user_id, filename, media_type, location_country, location_state, location_city, location_area, created_at, location_road_name, total_potholes, total_cracks, critical_damages, average_confidence, detections_json, updated_at, condition_score, latitude, longitude) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                filename,
+                media_type,
+                location_country,
+                location_state,
+                location_city,
+                location_area,
+                datetime.datetime.now().isoformat(),
+                location_road_name,
+                total_potholes,
+                total_cracks,
+                critical_damages,
+                average_confidence,
+                detections_json,
+                datetime.datetime.now().isoformat(),
+                condition_score,
+                latitude,
+                longitude,
+            ),
+        )
+        self.connection.commit()
+
+    def get_detection_history(self, user_id):
+        self.cursor.execute("SELECT * FROM detections WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+        return self.cursor.fetchall()
+
+    def get_detection_by_id(self, detection_id):
+        self.cursor.execute("SELECT * FROM detections WHERE id = ?", (detection_id,))
+        return self.cursor.fetchone()
+
+    def add_location(self, user_id, country, state, district, city, area, road_name, latitude, longitude):
+        created_at = datetime.datetime.now().isoformat()
+        self.cursor.execute(
+            "INSERT INTO locations (user_id, country, state, district, city, area, road_name, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, country, state, district, city, area, road_name, str(latitude), str(longitude), created_at),
+        )
+        self.connection.commit()
+        return self.cursor.lastrowid
+
+    def get_locations(self, user_id):
+        # Explicit column order to avoid DataFrame column mismatch
+        self.cursor.execute(
+            "SELECT id, user_id, country, state, district, city, area, road_name, latitude, longitude, created_at FROM locations WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        )
+        rows = self.cursor.fetchall()
+        # return as list of tuples so pandas DataFrame with explicit columns works reliably
+        return [tuple(r) for r in rows]
+
+    def add_detection_event(self, user_id, label, confidence, bbox, latitude, longitude, location_country="", location_state="", location_district="", location_city="", location_area="", location_road_name="", screenshot_path="", source="", severity="Low"):
+        detection_time = datetime.datetime.now().isoformat()
+        try:
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO detection_events (user_id, detection_time, label, confidence, bbox, latitude, longitude, location_country, location_state, location_district, location_city, location_area, location_road_name, screenshot_path, source, severity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    detection_time,
+                    label,
+                    float(confidence),
+                    json.dumps(bbox),
+                    str(latitude),
+                    str(longitude),
+                    location_country,
+                    location_state,
+                    location_district,
+                    location_city,
+                    location_area,
+                    location_road_name,
+                    screenshot_path,
+                    source,
+                    severity,
+                ),
+            )
+            self.connection.commit()
+            return self.cursor.lastrowid
+        except Exception as e:
+            print(f"[db] Failed to add detection_event: {e}")
+            return None
+
+    def get_detection_events(self, user_id, limit=1000):
+        self.cursor.execute("SELECT id, user_id, detection_time, label, confidence, bbox, latitude, longitude, location_country, location_state, location_district, location_city, location_area, location_road_name, screenshot_path, source FROM detection_events WHERE user_id = ? ORDER BY detection_time DESC LIMIT ?", (user_id, limit))
+        rows = self.cursor.fetchall()
+        return [tuple(r) for r in rows]
+
+    def get_dashboard_metrics(self, user_id):
+        self.cursor.execute(
+            "SELECT COUNT(*) AS total_inspections, SUM(total_potholes) AS total_potholes, SUM(total_cracks) AS total_cracks, SUM(critical_damages) AS critical_damages, AVG(condition_score) AS road_condition_score FROM detections WHERE user_id = ?",
+            (user_id,),
+        )
+        row = self.cursor.fetchone()
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM detections WHERE user_id = ? AND media_type = 'image'",
+            (user_id,),
+        )
+        images = self.cursor.fetchone()[0]
+        self.cursor.execute(
+            "SELECT COUNT(*) FROM detections WHERE user_id = ? AND media_type = 'video'",
+            (user_id,),
+        )
+        videos = self.cursor.fetchone()[0]
+        return {
+            "total_inspections": row[0] or 0,
+            "total_potholes": row[1] or 0,
+            "total_cracks": row[2] or 0,
+            "critical_damages": row[3] or 0,
+            "road_condition_score": int(row[4] or 0),
+            "image_inspections": images,
+            "video_inspections": videos,
+        }
+
+    def estimate_condition_score(self, detections):
+        if not detections:
+            return 100
+        score = 100
+        for item in detections:
+            if item["severity"] == "Low":
+                score -= 5
+            elif item["severity"] == "Medium":
+                score -= 15
+            elif item["severity"] == "High":
+                score -= 30
+            elif item["severity"] == "Critical":
+                score -= 45
+        return max(10, min(100, score))

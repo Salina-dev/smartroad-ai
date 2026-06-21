@@ -1,0 +1,158 @@
+"""
+Road Damage Alert Notification Module.
+
+Provides alert functionality for Live Camera Detection:
+- Streamlit warning popup for detections >= 50% confidence
+- Deduplication (30 sec per damage type)
+- Optional sound alert via HTML/JS
+- Optional browser notification via HTML/JS Notification API
+"""
+import datetime
+import time
+import streamlit as st
+
+
+# Deduplication: track last alert time per damage type (e.g. "Pothole", "Crack")
+_last_alert_times = {}  # {damage_type: timestamp}
+
+
+def _should_alert(damage_type: str, cooldown_seconds: int = 30) -> bool:
+    """Returns True if an alert for this damage type can be shown (cooldown elapsed)."""
+    now = time.time()
+    last = _last_alert_times.get(damage_type, 0)
+    if now - last >= cooldown_seconds:
+        _last_alert_times[damage_type] = now
+        return True
+    return False
+
+
+def _extract_damage_type(label: str) -> str:
+    """Normalize a detection label into a damage type category."""
+    label_lower = label.lower()
+    if "pothole" in label_lower:
+        return "Pothole"
+    if "crack" in label_lower or "longitudinal" in label_lower or "transverse" in label_lower or "alligator" in label_lower:
+        return "Crack"
+    # Any other road damage label
+    return label
+
+
+def check_detections(
+    detections: list,
+    latitude: float = 0.0,
+    longitude: float = 0.0,
+    conf_threshold: float = 0.5,
+    enable_sound: bool = True,
+    enable_browser_notify: bool = True,
+):
+    """
+    Evaluate a list of detections and trigger alerts as needed.
+
+    Parameters
+    ----------
+    detections : list
+        List of detection dicts with keys: "label", "confidence", "bbox", etc.
+    latitude, longitude : float
+        Current GPS coordinates.
+    conf_threshold : float
+        Minimum confidence to trigger alert (default 0.5 = 50%).
+    enable_sound : bool
+        If True, injects JS to play a brief alert sound.
+    enable_browser_notify : bool
+        If True, injects JS to show a browser notification.
+    """
+    for item in detections:
+        confidence = item.get("confidence", 0)
+        if confidence < conf_threshold:
+            continue
+
+        label = item.get("label", "Unknown")
+        damage_type = _extract_damage_type(label)
+        if not damage_type:
+            continue
+
+        if not _should_alert(damage_type):
+            continue
+
+        confidence_pct = round(confidence * 100, 1)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # --- Streamlit warning popup ---
+        alert_msg = (
+            f"**⚠️ ROAD DAMAGE ALERT**\n\n"
+            f"**Damage Type:** {damage_type}\n\n"
+            f"**Confidence:** {confidence_pct}%\n\n"
+            f"**Latitude:** {latitude}\n\n"
+            f"**Longitude:** {longitude}\n\n"
+            f"**Time:** {now_str}"
+        )
+        st.warning(alert_msg)
+
+        # --- Optional sound alert ---
+        if enable_sound:
+            _play_alert_sound()
+
+        # --- Optional browser notification ---
+        if enable_browser_notify:
+            _show_browser_notification(damage_type, confidence_pct, latitude, longitude, now_str)
+
+
+def _play_alert_sound():
+    """Inject HTML/JS to play a short beep sound via Web Audio API."""
+    sound_html = """
+    <script>
+    (function() {
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            var osc = ctx.createOscillator();
+            var gain = ctx.createGain();
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.frequency.value = 880;
+            osc.type = 'sine';
+            gain.gain.setValueAtTime(0.3, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
+            osc.start(ctx.currentTime);
+            osc.stop(ctx.currentTime + 0.3);
+        } catch(e) {
+            console.warn('Alert sound not available:', e);
+        }
+    })();
+    </script>
+    """
+    st.components.v1.html(sound_html, height=0)
+
+
+def _show_browser_notification(damage_type: str, confidence_pct: float, latitude: float, longitude: float, timestamp: str):
+    """Inject HTML/JS to show a browser notification."""
+    notify_html = f"""
+    <script>
+    (function() {{
+        if (!("Notification" in window)) {{
+            console.warn("Browser notifications not supported.");
+            return;
+        }}
+        if (Notification.permission === "granted") {{
+            new Notification("⚠️ ROAD DAMAGE ALERT", {{
+                body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLat: {latitude}\\nLon: {longitude}\\nTime: {timestamp}",
+                icon: ""
+            }});
+        }} else if (Notification.permission !== "denied") {{
+            Notification.requestPermission().then(function(permission) {{
+                if (permission === "granted") {{
+                    new Notification("⚠️ ROAD DAMAGE ALERT", {{
+                        body: "Damage: {damage_type}\\nConfidence: {confidence_pct}%\\nLat: {latitude}\\nLon: {longitude}\\nTime: {timestamp}",
+                        icon: ""
+                    }});
+                }}
+            }});
+        }}
+    }})();
+    </script>
+    """
+    st.components.v1.html(notify_html, height=0)
+
+
+def reset_dedup():
+    """Clear all deduplication tracking (useful when starting a new session)."""
+    _last_alert_times.clear()

@@ -1,0 +1,1917 @@
+import os
+import csv
+import time
+import tempfile
+import datetime
+import json
+import sqlite3 
+import pathlib
+from pathlib import Path
+import urllib.request
+from streamlit_js_eval import get_geolocation
+
+import streamlit as st
+import folium
+from streamlit_folium import st_folium
+import streamlit.components.v1 as components
+import streamlit_folium
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import cv2
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.pdfgen import canvas
+
+from db import Database
+from detector import RoadDamageDetector, ROAD_DAMAGE_CLASSES
+from report_generator import ReportGenerator
+from notifications import check_detections, reset_dedup
+
+# App configuration
+st.set_page_config(
+    page_title="SmartRoad AI - Road Damage Monitoring",
+    page_icon="🚧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+DB_PATH = Path("smartroad.db")
+CONFIG_PATH = Path("config.json")
+DEFAULT_MODEL_PATH = Path("models/best.pt")
+
+def load_config():
+    if CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text())
+            if "model_path" not in config:
+                config["model_path"] = str(DEFAULT_MODEL_PATH)
+            return config
+        except Exception:
+            pass
+    default_config = {"model_path": str(DEFAULT_MODEL_PATH)}
+    save_config(default_config)
+    return default_config
+
+
+def save_config(config):
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+
+
+def reverse_geocode(latitude, longitude):
+    try:
+        url = (
+            f"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={latitude}&lon={longitude}&zoom=12&addressdetails=1"
+        )
+        request = urllib.request.Request(url, headers={"User-Agent": "SmartRoad-AI-Location/1.0"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            address = data.get("address", {})
+            return {
+                "country": address.get("country") or "",
+                "state": address.get("state") or address.get("region") or "",
+                "district": address.get("county") or address.get("state_district") or address.get("region") or "",
+                "city": address.get("city") or address.get("town") or address.get("village") or "",
+                "area": (
+                    address.get("suburb")
+                    or address.get("neighbourhood")
+                    or address.get("quarter")
+                    or address.get("hamlet")
+                    or ""
+                ),
+                "road": (
+                    address.get("road")
+                    or address.get("pedestrian")
+                    or address.get("residential")
+                    or address.get("path")
+                    or address.get("street")
+                    or ""
+                ),
+            }
+    except Exception as exc:
+        print(f"[location] Reverse geocode failed: {exc}")
+        return {"country": "", "state": "", "district": "", "city": "", "area": "", "road": ""}
+
+
+def get_geolocation_query():
+    if not hasattr(st, "get_query_params"):
+        return None, None
+
+    try:
+        params = st.get_query_params()
+    except Exception:
+        return None, None
+
+    lat_vals = params.get("geo_lat") or params.get("geoLat") or [None]
+    lon_vals = params.get("geo_lon") or params.get("geoLon") or [None]
+    lat = lat_vals[0]
+    lon = lon_vals[0]
+    if lat is None or lon is None:
+        return None, None
+
+    try:
+        latitude = float(lat)
+        longitude = float(lon)
+    except ValueError:
+        return None, None
+
+    if hasattr(st, "set_query_params"):
+        try:
+            st.set_query_params(**{})
+        except Exception:
+            pass
+
+    return latitude, longitude
+
+
+def populate_location_from_query():
+    latitude, longitude = get_geolocation_query()
+    if latitude is None or longitude is None:
+        return
+
+    geo_info = reverse_geocode(latitude, longitude)
+    st.session_state.loc_lat = str(latitude)
+    st.session_state.loc_lon = str(longitude)
+    st.session_state.loc_country = geo_info.get("country", "")
+    st.session_state.loc_state = geo_info.get("state", "")
+    st.session_state.loc_district = geo_info.get("district", "")
+    st.session_state.loc_city = geo_info.get("city", "")
+    st.session_state.loc_area = geo_info.get("area", "")
+    st.session_state.loc_road = geo_info.get("road", "")
+    st.session_state.gps_last_updated = datetime.datetime.now().isoformat()
+    st.session_state.gps_status = "Connected"
+
+
+config = load_config()
+MODEL_PATH = Path(config.get("model_path", "models/best.pt"))
+
+# Create directories
+Path("reports").mkdir(exist_ok=True)
+Path("uploads").mkdir(exist_ok=True)
+Path("models").mkdir(exist_ok=True)
+
+# Initialize services
+db = Database(DB_PATH)
+db.initialize()
+detector = RoadDamageDetector(model_path=MODEL_PATH)
+reporter = ReportGenerator()
+
+# Inject custom styles
+st.markdown(
+    """
+    <style>
+    .css-1d391kg {padding-top: 0rem;}
+    .main .block-container {padding-top: 1rem;}
+    .reportview-container .main .block-container {max-width: 1500px;}
+    .stButton>button {border-radius: 8px;}
+    .stSelectbox>div>div>div>select {background:#0e1117;color:#fff;}
+    footer {visibility: hidden;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Session helpers
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "nav" not in st.session_state:
+    st.session_state.nav = "Home"
+
+# initialize GPS/session keys so inputs can use them safely
+for k in ("loc_lat", "loc_lon", "loc_country", "loc_state", "loc_district", "loc_city", "loc_area", "loc_road", "gps_last_updated", "gps_status"):
+    if k not in st.session_state:
+        st.session_state[k] = ""
+populate_location_from_query()
+
+
+def login_form():
+    st.title("SmartRoad AI Login")
+    with st.form("login_form"):
+        email = st.text_input("Email Address")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+    if submitted:
+        user = db.get_user_by_email(email)
+        if user and db.verify_password(password, user["password_hash"]):
+            st.session_state.authenticated = True
+            st.session_state.user = {
+                "id": user[0],
+                "full_name": user[1],
+                "email": user[2],
+                "mobile": user[3],
+                "department": user[4],
+            }
+            st.success(f"Welcome, {user[1]}!")
+            st.rerun()
+        else:
+            st.error("Incorrect email or password.")
+
+    st.markdown("---")
+    st.info("New user? Register below.")
+    with st.form("register_form"):
+        full_name = st.text_input("Full Name", key="reg_name")
+        mobile = st.text_input("Mobile Number", key="reg_mobile")
+        department = st.text_input("Organization / Department", key="reg_org")
+        reg_email = st.text_input("Email Address", key="reg_email")
+        reg_password = st.text_input("Password", type="password", key="reg_password")
+        password_confirm = st.text_input("Confirm Password", type="password", key="reg_confirm")
+        register = st.form_submit_button("Register")
+
+    if register:
+        if not full_name or not reg_email or not reg_password:
+            st.error("Please fill all required fields.")
+            return
+
+        if reg_password != password_confirm:
+            st.error("Passwords do not match.")
+            return
+
+        # bcrypt supports only up to 72 bytes; we'll normalize in the DB layer,
+        # but still provide a user-friendly validation here.
+        if len(reg_password.encode("utf-8")) > 1024:
+            st.error("Password is too long. Please use a shorter password.")
+            return
+
+        if db.get_user_by_email(reg_email):
+            st.error("An account with this email already exists.")
+            return
+
+        try:
+            db.create_user(
+                full_name,
+                reg_email,
+                mobile,
+                department,
+                reg_password
+            )
+            st.success("Registration complete. Please login.")
+        except Exception as e:
+            st.error(f"Registration failed: {e}")
+
+def sidebar_navigation():
+    st.sidebar.title("SmartRoad AI")
+    st.sidebar.markdown("___")
+    st.sidebar.write(f"**Logged in as**\n{st.session_state.user['full_name']}")
+    selection = st.sidebar.radio(
+        "Navigation",
+        [
+            "Home",
+            "Upload Image",
+            "Upload Video",
+            "Live Camera Detection",
+            "GPS & Location Tracking",
+            "Detection History",
+            "Analytics Dashboard",
+            "Report Generation",
+            "User Profile",
+            "Settings",
+            "Logout",
+        ],
+        index=[
+            "Home",
+            "Upload Image",
+            "Upload Video",
+            "Live Camera Detection",
+            "GPS & Location Tracking",
+            "Detection History",
+            "Analytics Dashboard",
+            "Report Generation",
+            "User Profile",
+            "Settings",
+            "Logout",
+        ].index(st.session_state.nav),
+    )
+    st.session_state.nav = selection
+
+
+def show_home():
+    # Fetch Data
+    user_id = st.session_state.user["id"]
+    metrics = db.get_dashboard_metrics(user_id)
+    records = db.get_detection_history(user_id)
+    recent_events = db.get_detection_events(user_id, limit=5)
+    
+    # Custom CSS for Glassmorphism and enterprise-grade UI
+    st.markdown("""
+        <style>
+        /* Glassmorphism KPI Cards */
+        .kpi-container {
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+        }
+        .kpi-card {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 1.5rem;
+            flex: 1;
+            min-width: 200px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .kpi-card:hover {
+            transform: translateY(-4px);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.2), 0 10px 10px -5px rgba(0, 0, 0, 0.1);
+            background: rgba(30, 41, 59, 0.85);
+            border-color: rgba(59, 130, 246, 0.5);
+        }
+        .kpi-label {
+            color: #94a3b8;
+            font-size: 0.875rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.025em;
+            margin-bottom: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .kpi-value {
+            color: #f8fafc;
+            font-size: 2rem;
+            font-weight: 800;
+            line-height: 1;
+        }
+        
+        /* Alert Panel Styling */
+        .enterprise-alert {
+            background: rgba(239, 68, 68, 0.1);
+            border-left: 4px solid #ef4444;
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        
+        /* Quick Action Buttons */
+        .stButton button {
+            border-radius: 10px !important;
+            font-weight: 600 !important;
+            transition: all 0.2s !important;
+        }
+        .stButton button:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+        }
+        
+        /* glass card for containers */
+        .glass-panel {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 1.5rem;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            height: 100%;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Main Header with Status Indicators
+    hcol1, hcol2 = st.columns([3, 1])
+    with hcol1:
+        st.title("🚦SmartRoad AI Monitoring Center")
+        st.markdown(f"**District:** {st.session_state.user['department']} | **Auth Node:** {st.session_state.user['id']:04d}")
+    with hcol2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.success("\u25cf SYSTEM OPERATIONAL")
+
+    # Quick Action Matrix
+    st.markdown("#### \u26a1 Central Operations")
+    qcol1, qcol2, qcol3, qcol4, qcol5 = st.columns(5)
+    if qcol1.button("🖼️ Image Upload", use_container_width=True): st.session_state.nav = "Upload Image"; st.rerun()
+    if qcol2.button("🎥 Video Analysis", use_container_width=True): st.session_state.nav = "Upload Video"; st.rerun()
+    if qcol3.button("📡 Live Stream", use_container_width=True): st.session_state.nav = "Live Camera Detection"; st.rerun()
+    if qcol4.button("🛰️ GIS Network", use_container_width=True): st.session_state.nav = "GPS & Location Tracking"; st.rerun()
+    if qcol5.button("📄 Reports", use_container_width=True): st.session_state.nav = "Report Generation"; st.rerun()
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # KPI Statistics Row
+    kcol1, kcol2, kcol3, kcol4, kcol5 = st.columns(5)
+    
+    def render_kpi(col, label, value, icon, trend=None):
+        col.markdown(f"""
+            <div class="kpi-card">
+                <div class="kpi-label">{icon} {label}</div>
+                <div class="kpi-value">{value}</div>
+            </div>s
+        """, unsafe_allow_html=True)
+
+    render_kpi(kcol1, "TOTAL INSPECTIONS", metrics["total_inspections"], "📊")
+    render_kpi(kcol2, "POTHOLES DETECTED", metrics["total_potholes"], "🕳️")
+    render_kpi(kcol3, "CRACKS DETECTED", metrics["total_cracks"], "📈")
+    render_kpi(kcol4, "CRITICAL EVENTS", metrics["critical_damages"], "⚠️")
+    render_kpi(kcol5, "RESOLVED CASES", "0", "✅")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # GIS Map & Alerts Section
+    mcol1, mcol2 = st.columns([2, 1])
+
+    with mcol1:
+        st.markdown("### 🗺️ Interactive GIS Damage Network")
+        if records:
+            map_data = []
+            for row in records:
+                try:
+                    if row[17] and row[18]:
+                        map_data.append({
+                            "lat": float(row[17]),
+                            "lon": float(row[18]),
+                            "road": row[9] or "Unknown Segment",
+                            "severity": row[12],
+                            "date": row[8][:10]
+                        })
+                except: continue
+            
+            if map_data:
+                m_df = pd.DataFrame(map_data)
+                m = folium.Map(location=[m_df["lat"].mean(), m_df["lon"].mean()], 
+                              zoom_start=14, tiles="cartodbpositron")
+                for _, row in m_df.iterrows():
+                    color = "#ef4444" if row["severity"] > 0 else "#3b82f6"
+                    folium.CircleMarker(
+                        location=[row["lat"], row["lon"]],
+                        radius=7,
+                        popup=f"Road: {row['road']}<br>Criticals: {row['severity']}",
+                        color=color,
+                        fill=True,
+                        fill_color=color,
+                        fill_opacity=0.6
+                    ).add_to(m)
+                st_folium(m, height=420, use_container_width=True)
+            else:
+                st.info("No geospatial telemetry available.")
+        else:
+            st.info("No inspection telemetry records.")
+
+    with mcol2:
+        st.markdown("🚨 Enterprise Alerts")
+        if metrics["critical_damages"] > 0:
+            st.markdown(f"""
+                <div class="enterprise-alert">
+                    <div style="font-weight:700; color:#ef4444; margin-bottom:4px;"> HIGH PRIORITY ALERT</div>
+                    <div style="font-size:0.875rem; color:#f8fafc;">
+                        {metrics['critical_damages']} critical structural failures identified. 
+                        Dispatch repair protocols for high-risk zones immediately.
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.success("\u2705 Network structural integrity verified. No critical failures.")
+            
+        st.markdown("📋 Recent Activity Log")
+        if recent_events:
+            for e in recent_events[:4]:
+                st.markdown(f"""
+                    <div style="font-size:0.8rem; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <span style="color:#94a3b8;">{e[2][11:16]}</span> | 
+                        <span style="color:#38bdf8; font-weight:600;">{e[3]}</span> 
+                        detected at {e[13] or 'Segment ' + str(e[0])}
+                    </div>
+                """, unsafe_allow_html=True)
+        else:
+            st.caption("No recent activity data available.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Analytics Dashboard Section
+    st.markdown("📊 Strategic Analytics Dashboard")
+    ccol1, ccol2, ccol3 = st.columns(3)
+
+    if records:
+        chart_df = pd.DataFrame([
+            {
+                "date": row[8][:10],
+                "potholes": row[10],
+                "cracks": row[11],
+                "score": row[16]
+            }
+            for row in records
+        ])
+        chart_df["date"] = pd.to_datetime(chart_df["date"])
+        daily_stats = chart_df.groupby("date").sum().reset_index()
+
+        with ccol1:
+            fig_pie = px.pie(values=[metrics["total_potholes"], metrics["total_cracks"]], 
+                             names=["Potholes", "Cracks"],
+                             hole=0.5, color_discrete_sequence=['#3b82f6', '#818cf8'])
+            fig_pie.update_layout(title="Damage Classification", template="plotly_dark",
+                                 margin=dict(t=40, b=0, l=0, r=0), height=300, showlegend=False)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with ccol2:
+            fig_bar = px.bar(daily_stats, x="date", y=["potholes", "cracks"], barmode="group",
+                             color_discrete_sequence=['#3b82f6', '#10b981'])
+            fig_bar.update_layout(title="Damage Volume Tracking", template="plotly_dark",
+                                 margin=dict(t=40, b=0, l=0, r=0), height=300, 
+                                 xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with ccol3:
+            fig_trend = px.line(daily_stats, x="date", y="score")
+            fig_trend.update_traces(line_color='#10b981', line_width=3)
+            fig_trend.update_layout(title="Network Health Score (%)", template="plotly_dark",
+                                   margin=dict(t=40, b=0, l=0, r=0), height=300,
+                                   xaxis_title=None, yaxis_title=None)
+            st.plotly_chart(fig_trend, use_container_width=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Detailed Event Feed
+    st.markdown("🎯 Recent High-Fidelity Detections")
+    if recent_events:
+        for e in recent_events:
+            with st.container():
+                ecol1, ecol2, ecol3, ecol4, ecol5 = st.columns([1, 2, 1, 1, 1.5])
+                if e[14] and os.path.exists(e[14]):
+                    ecol1.image(e[14], width=100)
+                else:
+                    ecol1.markdown("<div style='width:100px; height:60px; background:#1e293b; border-radius:8px; display:flex; align-items:center; justify-content:center; color:#475569;'></div>", unsafe_allow_html=True)
+                
+                ecol2.markdown(f"**{e[3]}**<br><span style='color:#64748b; font-size:0.8rem;'>{e[13] or 'Main Road Network'}</span>", unsafe_allow_html=True)
+                ecol3.markdown(f"<span style='color:#38bdf8; font-weight:700;'>{e[4]*100:.1f}%</span><br><span style='color:#64748b; font-size:0.7rem;'>CONFIDENCE</span>", unsafe_allow_html=True)
+                
+                sev = "Critical" if e[4] > 0.8 else "High" if e[4] > 0.6 else "Normal"
+                sev_color = "#ef4444" if sev == "Critical" else "#f59e0b" if sev == "High" else "#10b981"
+                ecol4.markdown(f"<span style='color:{sev_color}; font-weight:700;'>{sev}</span><br><span style='color:#64748b; font-size:0.7rem;'>SEVERITY</span>", unsafe_allow_html=True)
+                
+                ecol5.markdown(f"<span style='color:#cbd5e1; font-size:0.85rem;'>{e[2][:16]}</span>", unsafe_allow_html=True)
+                st.markdown("<div style='height:1px; background:rgba(255,255,255,0.05); margin:10px 0;'></div>", unsafe_allow_html=True)
+    else:
+        st.info("No recent detection events processed.")
+
+
+def render_detection_results(image_path, detections, location):
+    image = cv2.imread(str(image_path))
+    if image is None:
+        st.error("Could not load the image for display.")
+        return
+
+    if not detections:
+        st.warning("No road damage detections were found in this image.")
+        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Uploaded image", use_column_width=True)
+        return
+
+    # Use the enhanced drawing logic from detector
+    image = detector.draw_detections(image, detections)
+    st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="Detected damages", use_column_width=True)
+
+    # --- Professional Detection Summary Cards ---
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.markdown("### 🔍 Detection Results")
+
+    # Severity color map
+    severity_colors = {"Critical": "#dc2626", "High": "#ea580c", "Medium": "#d97706", "Low": "#16a34a"}
+
+    cols_per_row = 2
+    items = list(enumerate(detections))
+    for row_start in range(0, len(items), cols_per_row):
+        row_items = items[row_start: row_start + cols_per_row]
+        cols = st.columns(len(row_items))
+        for col, (idx, item) in zip(cols, row_items):
+            sev = item["severity"]
+            badge_color = severity_colors.get(sev, "#6b7280")
+            conf_pct = f"{item['confidence'] * 100:.1f}%"
+            with col:
+                st.markdown(
+                    f"""
+                    <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:18px 20px;margin-bottom:12px;">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                            <span style="color:#94a3b8;font-size:12px;font-weight:600;letter-spacing:0.05em;">DETECTION #{idx+1}</span>
+                            <span style="background:{badge_color};color:#fff;font-size:11px;font-weight:700;padding:2px 10px;border-radius:20px;">{sev}</span>
+                        </div>
+                        <div style="margin-bottom:8px;">
+                            <span style="color:#64748b;font-size:12px;">Damage Type</span><br>
+                            <span style="color:#f1f5f9;font-size:16px;font-weight:700;">{item['label']}</span>
+                        </div>
+                        <div style="display:flex;gap:24px;margin-bottom:8px;">
+                            <div>
+                                <span style="color:#64748b;font-size:12px;">Confidence</span><br>
+                                <span style="color:#38bdf8;font-size:18px;font-weight:800;">{conf_pct}</span>
+                            </div>
+                        </div>
+                        <div style="margin-bottom:8px;">
+                            <span style="color:#64748b;font-size:12px;">Date & Time</span><br>
+                            <span style="color:#cbd5e1;font-size:13px;">{item.get('timestamp', now_str)}</span>
+                        </div>
+                        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #334155;">
+                            <span style="color:#4ade80;font-size:13px;font-weight:600;">✔ Detected Successfully</span>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+    if location:
+        st.map(pd.DataFrame([location], columns=["latitude", "longitude"]))
+
+
+def render_enterprise_alert(detections):
+    """Render a high-priority enterprise-style alert card for critical/high severity detections."""
+    critical = [d for d in detections if d.get("severity") == "Critical"]
+    high = [d for d in detections if d.get("severity") == "High"]
+    flagged = critical or high
+    if not flagged:
+        return
+
+    level_label = "CRITICAL ALERT" if critical else "HIGH SEVERITY ALERT"
+    border_color = "#ef4444" if critical else "#f59e0b"
+    bg_color = "rgba(239,68,68,0.12)" if critical else "rgba(245,158,11,0.12)"
+    icon = "🚨" if critical else "⚠️"
+
+    items_html = "".join([
+        f"<div style='margin:6px 0; padding:8px 12px; background:rgba(0,0,0,0.25); border-radius:8px;'>"
+        f"<span style='color:#f8fafc; font-weight:700;'>{d['label']}</span>"
+        f"<span style='color:#94a3b8; font-size:0.85rem; margin-left:8px;'>Confidence: {d['confidence']*100:.1f}%</span>"
+        f"<span style='background:{border_color}; color:#fff; font-size:0.75rem; font-weight:700; padding:2px 8px; border-radius:12px; margin-left:8px;'>{d['severity']}</span>"
+        f"</div>"
+        for d in flagged
+    ])
+
+    st.markdown(f"""
+        <div style="background:{bg_color}; border:2px solid {border_color}; border-radius:14px;
+                    padding:1.25rem 1.5rem; margin:1rem 0; box-shadow:0 4px 24px rgba(239,68,68,0.25);">
+            <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px;">
+                <span style="font-size:1.5rem;">{icon}</span>
+                <div>
+                    <div style="color:{border_color}; font-size:1rem; font-weight:800; letter-spacing:0.05em;">{level_label}</div>
+                    <div style="color:#94a3b8; font-size:0.8rem;">Immediate dispatch and repair action required</div>
+                </div>
+                <span style="margin-left:auto; color:{border_color}; font-size:0.8rem; font-weight:600;">{datetime.datetime.now().strftime('%H:%M:%S')}</span>
+            </div>
+            {items_html}
+        </div>
+    """, unsafe_allow_html=True)
+
+    # Play alert sound for critical/high damage
+    sound_html = """
+    <script>
+    (function() {
+        try {
+            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+            var freqs = [880, 1100, 880];
+            var t = ctx.currentTime;
+            freqs.forEach(function(freq, i) {
+                var osc = ctx.createOscillator();
+                var gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.frequency.value = freq; osc.type = 'square';
+                gain.gain.setValueAtTime(0.2, t + i * 0.2);
+                gain.gain.exponentialRampToValueAtTime(0.001, t + i * 0.2 + 0.18);
+                osc.start(t + i * 0.2); osc.stop(t + i * 0.2 + 0.18);
+            });
+        } catch(e) { console.warn('Sound unavailable:', e); }
+    })();
+    </script>
+    """
+    components.html(sound_html, height=0)
+
+
+def image_detection_page():
+    st.header("🖼️ Upload Image")
+    st.write("Upload road inspection images for real-time damage detection.")
+
+    uploaded_image = st.file_uploader("Choose an image file", type=["jpg", "jpeg", "png"], key="image_upload")
+
+    # Initialize location fields from session state defaults
+    country = st.session_state.get("loc_country", "")
+    state = st.session_state.get("loc_state", "")
+    district = st.session_state.get("loc_district", "")
+    city = st.session_state.get("loc_city", "")
+    area = st.session_state.get("loc_area", "")
+    road_name = st.session_state.get("loc_road", "")
+    latitude = st.session_state.get("loc_lat", "")
+    longitude = st.session_state.get("loc_lon", "")
+
+    st.markdown("""
+        <div style="background:rgba(30,41,59,0.6);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,0.08);
+                    border-radius:14px;padding:1.5rem 1.8rem;margin-bottom:1.2rem;">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;">
+                <span style="font-size:1.6rem;">📍</span>
+                <span style="color:#f1f5f9;font-size:1.25rem;font-weight:700;">Location Details</span>
+                <span style="margin-left:auto;font-size:0.8rem;color:#64748b;background:rgba(100,116,139,0.15);
+                      padding:4px 12px;border-radius:20px;">Geospatial Reference</span>
+            </div>
+    """, unsafe_allow_html=True)
+    st.markdown('<div style="font-size:0.9rem;color:#94a3b8;margin-bottom:10px;">Capture precise inspection coordinates for asset mapping and GIS integration.</div>', unsafe_allow_html=True)
+    components.html(
+        """
+        <div style="margin:10px 0 16px 0;">
+        <button onclick="getLocation()" style="padding:10px 20px;font-size:14px;cursor:pointer;
+          background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;border:none;
+          border-radius:10px;font-weight:600;box-shadow:0 4px 14px rgba(37,99,235,0.3);
+          transition:all 0.2s;">
+          📡 Auto-Detect My Location
+        </button>
+        </div>
+        <script>
+        function getLocation() {
+            if (!navigator.geolocation) { alert('Geolocation not supported.'); return; }
+            navigator.geolocation.getCurrentPosition(function(pos) {
+                var url = new URL(window.location.href);
+                url.searchParams.set('geo_lat', pos.coords.latitude);
+                url.searchParams.set('geo_lon', pos.coords.longitude);
+                window.location.href = url.toString();
+            }, function(err) { alert('Location error: ' + err.message); },
+            {enableHighAccuracy: true, timeout: 10000});
+        }
+        </script>
+        """,
+        height=80,
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        country = st.text_input("🌍 Country", value=country, key="loc_country", placeholder="e.g. India")
+        district = st.text_input("🏛️ District", value=district, key="loc_district", placeholder="e.g. Chennai District")
+        area = st.text_input("🏘️ Area / Suburb", value=area, key="loc_area", placeholder="e.g. T Nagar")
+        latitude = st.text_input("🌐 Latitude", value=latitude, key="loc_lat", placeholder="e.g. 13.0827")
+    with c2:
+        state = st.text_input("🗺️ State", value=state, key="loc_state", placeholder="e.g. Tamil Nadu")
+        city = st.text_input("🏙️ City", value=city, key="loc_city", placeholder="e.g. Chennai")
+        road_name = st.text_input("🛣️ Road Name", value=road_name, key="loc_road", placeholder="e.g. Mount Road")
+        longitude = st.text_input("🌐 Longitude", value=longitude, key="loc_lon", placeholder="e.g. 80.2707")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Show map preview if coordinates available
+    if latitude and longitude:
+        try:
+            st.map(pd.DataFrame([{"latitude": float(latitude), "longitude": float(longitude)}]))
+        except Exception:
+            st.info("Unable to plot the provided GPS coordinates.")
+
+    if uploaded_image:
+        image_path = Path("uploads") / f"image_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_image.name}"
+        with open(image_path, "wb") as f:
+            f.write(uploaded_image.getbuffer())
+
+        if detector.is_ready:
+            with st.spinner("Analyzing image for road damage..."):
+                detections = detector.detect_image(image_path)
+
+            # --- Enterprise alert cards ---
+            if detections:
+                render_enterprise_alert(detections)
+
+            # --- Streamlit + browser notifications ---
+            try:
+                alert_lat = float(latitude) if latitude else 0.0
+                alert_lon = float(longitude) if longitude else 0.0
+            except (ValueError, TypeError):
+                alert_lat, alert_lon = 0.0, 0.0
+
+            check_detections(
+                detections,
+                latitude=alert_lat,
+                longitude=alert_lon,
+                address=road_name or st.session_state.get("loc_road", ""),
+                conf_threshold=0.5,
+                enable_sound=True,
+                enable_browser_notify=True,
+            )
+
+            location = None
+            if latitude and longitude:
+                try:
+                    location = {"latitude": float(latitude), "longitude": float(longitude)}
+                except ValueError:
+                    location = None
+
+            render_detection_results(image_path, detections, location)
+
+            # --- GIS Map of detection location ---
+            if location:
+                st.markdown("#### 🗺️ Detection Location (GIS)")
+                m = folium.Map(
+                    location=[location["latitude"], location["longitude"]],
+                    zoom_start=16, tiles="cartodbpositron"
+                )
+                for det in detections:
+                    sev = det.get("severity", "Low")
+                    pin_color = "red" if sev == "Critical" else "orange" if sev == "High" else "blue"
+                    folium.Marker(
+                        location=[location["latitude"], location["longitude"]],
+                        popup=f"{det['label']} — {det['confidence']*100:.1f}% confidence",
+                        icon=folium.Icon(color=pin_color, icon="exclamation-sign"),
+                    ).add_to(m)
+                st_folium(m, height=350, use_container_width=True)
+
+            # --- AUTO-SAVE to database ---
+            severity_counts = {"Low": 0, "Medium": 0, "High": 0, "Critical": 0}
+            for item in detections:
+                severity_counts[item.get("severity", "Low")] += 1
+            total_potholes = sum(1 for item in detections if item["label"] == "Pothole")
+            total_cracks = sum(1 for item in detections if "Crack" in item["label"])
+            condition_score = db.estimate_condition_score(detections)
+            avg_conf = round(sum(d["confidence"] for d in detections) / max(1, len(detections)), 3)
+
+            db.add_detection_record(
+                user_id=st.session_state.user["id"],
+                filename=str(image_path),
+                media_type="image",
+                location_country=country,
+                location_state=state,
+                location_city=city,
+                location_area=area,
+                location_road_name=road_name,
+                latitude=latitude,
+                longitude=longitude,
+                total_potholes=total_potholes,
+                total_cracks=total_cracks,
+                critical_damages=severity_counts["Critical"],
+                average_confidence=avg_conf,
+                condition_score=condition_score,
+                detections_json=json.dumps(detections),
+            )
+
+            for det in detections:
+                db.add_detection_event(
+                    user_id=st.session_state.user["id"],
+                    label=det["label"],
+                    confidence=det["confidence"],
+                    bbox=det["bbox"],
+                    latitude=latitude,
+                    longitude=longitude,
+                    location_country=country,
+                    location_state=state,
+                    location_district=district,
+                    location_city=city,
+                    location_area=area,
+                    location_road_name=road_name,
+                    screenshot_path=str(image_path),
+                    source="Image",
+                    severity=det.get("severity", "Low"),
+                )
+
+            if detections:
+                st.success(f"✅ {len(detections)} detection(s) automatically saved to history.")
+                if severity_counts["Critical"] > 0:
+                    st.error("⚠️ Critical road conditions detected. Immediate action recommended.")
+            else:
+                st.info("No damages detected. Record saved to history.")
+        else:
+            st.error("Detection model is unavailable. Configure a valid YOLOv8 weights file in Settings.")
+            st.info("Use the Settings page to upload a YOLOv8 `.pt` weights file or set the correct model path.")
+
+
+def video_detection_page():
+    st.header("Upload Video")
+    st.write("Upload road inspection video and process it frame-by-frame.")
+    uploaded_video = st.file_uploader("Choose a video file", type=["mp4", "mov", "avi"], key="video_upload")
+    if uploaded_video:
+        video_path = Path("uploads") / f"video_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{uploaded_video.name}"
+        with open(video_path, "wb") as f:
+            f.write(uploaded_video.getbuffer())
+
+        if detector.is_ready:
+            st.info("Processing video... this may take a few moments.")
+            output_path = Path("uploads") / f"processed_{video_path.name}"
+            video_summary = detector.process_video(video_path, output_path, progress_callback=st.progress(0))
+            st.video(str(output_path))
+            st.write("### Video Analytics")
+            st.json(video_summary)
+            st.success("Video processing complete.")
+            
+            # --- Trigger Alerts for Video Detection ---
+            if video_summary["detections"]:
+                # Trigger alerts for detections with > 50% confidence
+                check_detections(
+                    video_summary["detections"],
+                    latitude=0.0,
+                    longitude=0.0,
+                    address="Video Inspection",
+                    conf_threshold=0.5,
+                    enable_sound=True,
+                    enable_browser_notify=True
+                )
+
+            db.add_detection_record(
+                user_id=st.session_state.user["id"],
+                filename=str(video_path),
+                media_type="video",
+                location_country="",
+                location_state="",
+                location_city="",
+                location_area="",
+                location_road_name="",
+                latitude="",
+                longitude="",
+                total_potholes=video_summary["total_potholes"],
+                total_cracks=video_summary["total_cracks"],
+                critical_damages=video_summary["critical_damages"],
+                average_confidence=video_summary["average_confidence"],
+                condition_score=video_summary["road_condition_score"],
+                detections_json=json.dumps(video_summary["detections"]),
+            )
+            
+            # Save granular detection events for video
+            for det in video_summary["detections"]:
+                db.add_detection_event(
+                    user_id=st.session_state.user["id"],
+                    label=det["label"],
+                    confidence=det["confidence"],
+                    bbox=det["bbox"],
+                    latitude="",
+                    longitude="",
+                    screenshot_path=str(output_path),
+                    source="Video"
+                )
+        else:
+            st.error("Detection model is unavailable. Configure a valid YOLOv8 weights file in Settings.")
+            st.info("Use the Settings page to upload a YOLOv8 `.pt` weights file or set the correct model path.")
+
+
+def live_detection_page():
+    st.header("📡 Live Camera Detection")
+    st.write("Start a real-time road inspection using a webcam or RTSP stream URL.")
+
+    # --- Initialize session state keys ---
+    if "live_inspection_active" not in st.session_state:
+        st.session_state.live_inspection_active = False
+        st.session_state.live_camera_running = False
+        st.session_state.live_stats = {
+            "total_frames": 0, "total_potholes": 0, "total_cracks": 0,
+            "critical_damages": 0, "snapshots": [], "last_detections": [],
+            "all_detections": [], "total_detections": 0,
+        }
+        st.session_state.live_camera_status = "⏹️ Stopped"
+        st.session_state.live_gps_status = "📍 Not Available"
+        st.session_state.live_last_detection = "—"
+        st.session_state.live_current_location = "—"
+        st.session_state.live_detection_history = []
+        st.session_state.live_gps_error = ""
+
+    # --- Auto GPS capture on page load (only if not already captured) ---
+    if not st.session_state.get("loc_lat"):
+        components.html(
+            """
+            <script>
+            (function autoGPS() {
+                if (!navigator.geolocation) return;
+                navigator.geolocation.getCurrentPosition(function(pos) {
+                    var url = new URL(window.location.href);
+                    if (!url.searchParams.has('geo_lat')) {
+                        url.searchParams.set('geo_lat', pos.coords.latitude);
+                        url.searchParams.set('geo_lon', pos.coords.longitude);
+                        window.location.href = url.toString();
+                    }
+                }, function(err) {
+                    console.warn('Auto GPS error:', err.message);
+                }, {enableHighAccuracy: true, timeout: 8000});
+            })();
+            </script>
+            """,
+            height=0,
+        )
+
+    # --- Camera Configuration ---
+    stream_url = st.text_input("RTSP / HTTP camera URL (leave blank for local webcam)", key="camera_url")
+    cfg1, cfg2 = st.columns(2)
+    frame_skip = cfg1.number_input("Process every nth frame", min_value=1, max_value=10, value=3, step=1,
+                                    help="Lower = more frequent detection; higher = better performance.")
+    capture_width = cfg2.number_input("Live frame max width", min_value=320, max_value=1280, value=640, step=64,
+                                       help="Resize live frames to this width before detection.")
+
+    # --- Alert Notification Toggles ---
+    st.markdown("#### 🔔 Alert Settings")
+    notify_col1, notify_col2, notify_col3 = st.columns(3)
+    with notify_col1:
+        enable_alerts = st.checkbox("Enable Road Damage Alerts", value=True, key="live_enable_alerts",
+                                     help="Show alert card when damage detected.")
+    with notify_col2:
+        enable_sound = st.checkbox("Sound Alert (Beep)", value=True, key="live_enable_sound",
+                                   help="Play alarm beep on every damage detection.")
+    with notify_col3:
+        enable_browser = st.checkbox("Browser Notification", value=True, key="live_enable_browser",
+                                     help="Push a desktop browser notification on damage detected.")
+
+    # --- Start / Stop Buttons ---
+    bcol1, bcol2 = st.columns(2)
+    if bcol1.button("▶️ Start Live Road Inspection", use_container_width=True, disabled=st.session_state.live_inspection_active):
+        # Auto-capture GPS on start via JS redirect
+        components.html(
+            """
+            <script>
+            (function() {
+                if (!navigator.geolocation) return;
+                navigator.geolocation.getCurrentPosition(function(pos) {
+                    var url = new URL(window.location.href);
+                    url.searchParams.set('geo_lat', pos.coords.latitude);
+                    url.searchParams.set('geo_lon', pos.coords.longitude);
+                    window.location.href = url.toString();
+                }, function(err) {
+                    var url = new URL(window.location.href);
+                    url.searchParams.set('gps_error', encodeURIComponent(err.message));
+                    window.location.href = url.toString();
+                }, {enableHighAccuracy: true, timeout: 10000});
+            })();
+            </script>
+            """,
+            height=0,
+        )
+        st.session_state.live_inspection_active = True
+        st.session_state.live_camera_running = True
+        st.session_state.live_stats = {
+            "total_frames": 0, "total_potholes": 0, "total_cracks": 0,
+            "critical_damages": 0, "snapshots": [], "last_detections": [],
+            "all_detections": [], "total_detections": 0,
+        }
+        st.session_state.live_detection_history = []
+        st.session_state.live_camera_status = "📷 Active"
+        if st.session_state.get("loc_lat"):
+            st.session_state.live_gps_status = "📍 Connected"
+        else:
+            st.session_state.live_gps_status = "📍 Searching..."
+        reset_dedup()
+        st.rerun()
+
+    if bcol2.button("⏹️ Stop Live Road Inspection", use_container_width=True, disabled=not st.session_state.live_inspection_active):
+        st.session_state.live_inspection_active = False
+        st.session_state.live_camera_running = False
+        st.session_state.live_camera_status = "⏹️ Stopped"
+        st.rerun()
+
+    # --- GPS Error Handling ---
+    try:
+        params = st.get_query_params()
+        gps_err = params.get("gps_error", [None])[0]
+        if gps_err:
+            from urllib.parse import unquote
+            gps_err = unquote(gps_err)
+            if "denied" in gps_err.lower() or "permission" in gps_err.lower():
+                st.session_state.live_gps_error = "Location permission denied by user"
+                st.session_state.live_gps_status = "📍 Permission Denied"
+            else:
+                st.session_state.live_gps_error = f"Unable to retrieve GPS location: {gps_err}"
+                st.session_state.live_gps_status = "📍 Unavailable"
+            # Clear the error param
+            st.set_query_params(**{k: v for k, v in params.items() if k != "gps_error"})
+    except Exception:
+        pass
+
+    # --- GPS Status Indicator ---
+    gps_connected = bool(st.session_state.get("loc_lat"))
+    gps_color = "#10b981" if gps_connected else "#ef4444"
+    gps_text = "Connected" if gps_connected else "Not Available"
+    if st.session_state.live_gps_error:
+        gps_text = "Error"
+        gps_color = "#ef4444"
+
+    st.markdown(f"""
+        <div style="display:flex;align-items:center;gap:12px;padding:8px 16px;background:rgba(30,41,59,0.5);border-radius:10px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.05);">
+            <span style="font-size:1.2rem;">📍</span>
+            <span style="color:#94a3b8;font-size:0.85rem;font-weight:600;">GPS Status:</span>
+            <span style="color:{gps_color};font-size:0.9rem;font-weight:700;">● {gps_text}</span>
+            <span style="margin-left:auto;color:#64748b;font-size:0.8rem;">
+                {f"Last updated: {st.session_state.get('gps_last_updated', '—')}" if gps_connected else ""}
+            </span>
+        </div>
+    """, unsafe_allow_html=True)
+
+    if st.session_state.live_gps_error:
+        st.warning(st.session_state.live_gps_error)
+
+    # --- Live Status Indicators Row ---
+    if st.session_state.live_inspection_active:
+        status_col1, status_col2, status_col3, status_col4 = st.columns(4)
+        with status_col1:
+            cam_color = "#10b981" if st.session_state.live_camera_running else "#ef4444"
+            st.markdown(f"<div style='background:rgba(16,185,129,0.15);border:1px solid {cam_color};border-radius:10px;padding:10px;text-align:center;'><span style='font-size:1.2rem;'>📷</span><br><span style='color:{cam_color};font-weight:700;font-size:0.85rem;'>Camera</span><br><span style='color:#f8fafc;font-size:0.9rem;'>{st.session_state.live_camera_status}</span></div>", unsafe_allow_html=True)
+        with status_col2:
+            st.markdown(f"<div style='background:rgba(16,185,129,0.15);border:1px solid {gps_color};border-radius:10px;padding:10px;text-align:center;'><span style='font-size:1.2rem;'>📍</span><br><span style='color:{gps_color};font-weight:700;font-size:0.85rem;'>GPS</span><br><span style='color:#f8fafc;font-size:0.9rem;'>{gps_text}</span></div>", unsafe_allow_html=True)
+        with status_col3:
+            st.markdown(f"<div style='background:rgba(59,130,246,0.15);border:1px solid #3b82f6;border-radius:10px;padding:10px;text-align:center;'><span style='font-size:1.2rem;'>🎯</span><br><span style='color:#3b82f6;font-weight:700;font-size:0.85rem;'>Last Detection</span><br><span style='color:#f8fafc;font-size:0.9rem;'>{st.session_state.live_last_detection}</span></div>", unsafe_allow_html=True)
+        with status_col4:
+            loc_display = st.session_state.get("loc_city", "") or st.session_state.get("loc_area", "") or "—"
+            st.markdown(f"<div style='background:rgba(139,92,246,0.15);border:1px solid #8b5cf6;border-radius:10px;padding:10px;text-align:center;'><span style='font-size:1.2rem;'>🌍</span><br><span style='color:#8b5cf6;font-weight:700;font-size:0.85rem;'>Location</span><br><span style='color:#f8fafc;font-size:0.9rem;'>{loc_display}</span></div>", unsafe_allow_html=True)
+
+    # --- Main Layout: Camera Feed (left) + Location Info Card (right) ---
+    if st.session_state.live_inspection_active:
+        live_main_col1, live_main_col2 = st.columns([3, 2])
+
+        with live_main_col1:
+            frame_display = st.empty()
+            status_display = st.empty()
+            alert_display = st.empty()
+
+        with live_main_col2:
+            # --- Live Location Information Card ---
+            loc_country = st.session_state.get("loc_country", "")
+            loc_state = st.session_state.get("loc_state", "")
+            loc_district = st.session_state.get("loc_district", "")
+            loc_city = st.session_state.get("loc_city", "")
+            loc_area = st.session_state.get("loc_area", "")
+            loc_road = st.session_state.get("loc_road", "")
+            loc_lat = st.session_state.get("loc_lat", "")
+            loc_lon = st.session_state.get("loc_lon", "")
+            gps_last = st.session_state.get("gps_last_updated", "")
+            if gps_last and len(gps_last) > 19:
+                gps_last = gps_last[:19]
+
+            gps_status_color = "#10b981" if gps_connected else "#ef4444"
+            gps_status_text = "Connected" if gps_connected else "Not Available"
+
+            st.markdown(f"""
+                <div style="background:rgba(30,41,59,0.7);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,0.1);
+                            border-radius:16px;padding:1.2rem 1.5rem;margin-bottom:1rem;">
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.08);padding-bottom:10px;">
+                        <span style="font-size:1.4rem;">📍</span>
+                        <span style="color:#f1f5f9;font-size:1.1rem;font-weight:700;">Live Location Information</span>
+                        <span style="margin-left:auto;font-size:0.7rem;color:{gps_status_color};background:rgba(16,185,129,0.15);
+                              padding:2px 10px;border-radius:20px;">● {gps_status_text}</span>
+                    </div>
+            """, unsafe_allow_html=True)
+
+            loc_items = [
+                ("🌍", "Country", loc_country or "—"),
+                ("🗺️", "State", loc_state or "—"),
+                ("🏛️", "District", loc_district or "—"),
+                ("🏙️", "City", loc_city or "—"),
+                ("🏘️", "Area", loc_area or "—"),
+                ("🛣️", "Road Name", loc_road or "—"),
+                ("🌐", "Latitude", loc_lat or "—"),
+                ("🌐", "Longitude", loc_lon or "—"),
+            ]
+
+            for icon, label, value in loc_items:
+                st.markdown(f"""
+                    <div style="display:flex;align-items:center;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
+                        <span style="font-size:1rem;margin-right:10px;min-width:24px;">{icon}</span>
+                        <span style="color:#374151;font-size:0.8rem;min-width:80px;font-weight:600;">{label}</span>
+                        <span style='color:#111827;font-size:1rem;font-weight:700;margin-left:8px;'>{value}</span>
+                    </div>
+                """, unsafe_allow_html=True)
+
+            # Last Updated Time
+            st.markdown(f"""
+                <div style="display:flex;align-items:center;padding:6px 0;">
+                    <span style="font-size:1rem;margin-right:10px;min-width:24px;">⏱️</span>
+                    <span style="color:#94a3b8;font-size:0.8rem;min-width:80px;font-weight:600;">Updated</span>
+                    <span style="color:#111827;font-size:0.9rem;font-weight:500;margin-left:8px;">{gps_last or "—"}</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+            # GPS Refresh button
+            components.html(
+                """
+                <div style="margin-top:12px;">
+                <button onclick="getGPS()" style="width:100%;padding:8px 0;font-size:12px;cursor:pointer;
+                  background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#fff;border:none;
+                  border-radius:8px;font-weight:600;">
+                  📡 Refresh GPS Location
+                </button>
+                </div>
+                <script>
+                function getGPS() {
+                    if (!navigator.geolocation) { alert('Geolocation not supported.'); return; }
+                    navigator.geolocation.getCurrentPosition(function(pos) {
+                        var url = new URL(window.location.href);
+                        url.searchParams.set('geo_lat', pos.coords.latitude);
+                        url.searchParams.set('geo_lon', pos.coords.longitude);
+                        window.location.href = url.toString();
+                    }, function(err) {
+                        var url = new URL(window.location.href);
+                        url.searchParams.set('gps_error', encodeURIComponent(err.message));
+                        window.location.href = url.toString();
+                    }, {enableHighAccuracy: true, timeout: 10000});
+                }
+                </script>
+                """,
+                height=60,
+            )
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ========== DETECTION LOOP ==========
+        cap = cv2.VideoCapture(stream_url if stream_url else 0)
+        if not cap.isOpened():
+            st.error("Unable to open camera stream.")
+            st.session_state.live_inspection_active = False
+            st.session_state.live_camera_running = False
+            st.session_state.live_camera_status = "❌ Error"
+            return
+
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, capture_width)
+
+        frame_count = 0
+
+        try:
+            alert_lat = float(loc_lat) if loc_lat else 0.0
+            alert_lon = float(loc_lon) if loc_lon else 0.0
+        except (ValueError, TypeError):
+            alert_lat, alert_lon = 0.0, 0.0
+
+        # Continuous loop - NO max_frames limit, runs until user stops
+        while cap.isOpened() and st.session_state.live_inspection_active:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.03)
+                continue
+
+            frame_count += 1
+            st.session_state.live_stats["total_frames"] += 1
+
+            # Run detection on every nth frame
+            if frame_count % frame_skip == 0:
+                detections = detector.detect_frame(frame, conf=0.15, imgsz=640, resize_max=capture_width)
+                st.session_state.live_stats["last_detections"] = detections
+            else:
+                detections = st.session_state.live_stats["last_detections"]
+
+            if detections:
+                # Draw detections on frame
+                frame = detector.draw_detections(frame, detections)
+
+                # Update statistics
+                for item in detections:
+                    if item["label"] == "Pothole":
+                        st.session_state.live_stats["total_potholes"] += 1
+                    if "Crack" in item["label"]:
+                        st.session_state.live_stats["total_cracks"] += 1
+                    if item["severity"] in ("Critical", "High"):
+                        st.session_state.live_stats["critical_damages"] += 1
+
+                # --- Save screenshot for EVERY detection ---
+                snap_path = Path("uploads") / f"live_snap_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_{st.session_state.live_stats['total_detections']+1}.jpg"
+                cv2.imwrite(str(snap_path), frame)
+                st.session_state.live_stats["snapshots"].append(str(snap_path))
+                st.session_state.live_stats["total_detections"] += 1
+
+                # --- Save each detection event to DB with full location metadata ---
+                for det in detections:
+                    event_id = db.add_detection_event(
+                        user_id=st.session_state.user["id"],
+                        label=det["label"],
+                        confidence=det["confidence"],
+                        bbox=det["bbox"],
+                        latitude=loc_lat,
+                        longitude=loc_lon,
+                        location_country=loc_country,
+                        location_state=loc_state,
+                        location_district=loc_district,
+                        location_city=loc_city,
+                        location_area=loc_area,
+                        location_road_name=loc_road,
+                        screenshot_path=str(snap_path),
+                        source="Live",
+                        severity=det.get("severity", "Low"),
+                    )
+                    # Add to live detection history table
+                    st.session_state.live_detection_history.append({
+                        "id": event_id or "—",
+                        "time": datetime.datetime.now().strftime("%H:%M:%S"),
+                        "label": det["label"],
+                        "confidence": f"{det['confidence']*100:.1f}%",
+                        "severity": det.get("severity", "Low"),
+                        "lat": loc_lat or "—",
+                        "lon": loc_lon or "—",
+                        "country": loc_country or "—",
+                        "state": loc_state or "—",
+                        "city": loc_city or "—",
+                        "road": loc_road or "—",
+                    })
+
+                st.session_state.live_stats["all_detections"].extend(detections)
+
+                # --- Update last detection status ---
+                last_label = detections[-1]["label"]
+                last_conf = detections[-1]["confidence"] * 100
+                st.session_state.live_last_detection = f"{last_label} ({last_conf:.1f}%)"
+
+                # --- Alert notification for EVERY detection ---
+                if enable_alerts:
+                    sev_label = "CRITICAL" if any(d["severity"] == "Critical" for d in detections) else "HIGH" if any(d["severity"] == "High" for d in detections) else "DAMAGE"
+                    border_c = "#ef4444" if sev_label == "CRITICAL" else "#f59e0b" if sev_label == "HIGH" else "#3b82f6"
+                    items_html = "".join([
+                        f"<b style='color:#f8fafc;'>{d['label']}</b>"
+                        f"<span style='color:#94a3b8;font-size:0.8rem;margin-left:6px;'>{d['confidence']*100:.1f}%</span>&nbsp;"
+                        for d in detections
+                    ])
+                    alert_display.markdown(f"""
+                        <div style="background:rgba(59,130,246,0.12);border:2px solid {border_c};border-radius:12px;
+                                    padding:0.8rem 1rem;margin:6px 0;">
+                            <span style="color:{border_c};font-weight:800;font-size:0.9rem;">🚨 {sev_label} DETECTED &nbsp;|&nbsp;</span>
+                            {items_html}
+                            <span style="color:#94a3b8;font-size:0.75rem;float:right;">{datetime.datetime.now().strftime('%H:%M:%S')}</span>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                # --- Play beep sound for EVERY detection ---
+                if enable_sound:
+                    beep_html = """
+                    <script>
+                    (function() {
+                        try {
+                            var ctx = new (window.AudioContext || window.webkitAudioContext)();
+                            var osc = ctx.createOscillator();
+                            var gain = ctx.createGain();
+                            osc.connect(gain); gain.connect(ctx.destination);
+                            osc.frequency.value = 1200; osc.type = 'sine';
+                            gain.gain.setValueAtTime(0.15, ctx.currentTime);
+                            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+                            osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.15);
+                        } catch(e) { console.warn('Beep unavailable:', e); }
+                    })();
+                    </script>
+                    """
+                    components.html(beep_html, height=0)
+
+                # --- Browser notification ---
+                if enable_browser:
+                    check_detections(
+                        detections,
+                        latitude=alert_lat,
+                        longitude=alert_lon,
+                        address=loc_road,
+                        conf_threshold=0.5,
+                        enable_sound=False,
+                        enable_browser_notify=True,
+                    )
+
+            # --- Update camera feed ---
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_display.image(frame_rgb, channels="RGB", use_container_width=True)
+
+            # --- Update status bar ---
+            status_display.markdown(
+                f"""<div style="display:flex;gap:1.5rem;padding:8px 0;font-size:0.85rem;flex-wrap:wrap;">
+                    <span>🎞️ <b>Frames:</b> {st.session_state.live_stats['total_frames']}</span>
+                    <span>🕳️ <b>Potholes:</b> {st.session_state.live_stats['total_potholes']}</span>
+                    <span>📈 <b>Cracks:</b> {st.session_state.live_stats['total_cracks']}</span>
+                    <span style="color:#ef4444;">⚠️ <b>Critical:</b> {st.session_state.live_stats['critical_damages']}</span>
+                    <span style="color:#3b82f6;">📸 <b>Snapshots:</b> {st.session_state.live_stats['total_detections']}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
+            time.sleep(0.03)
+
+        # --- Camera stopped ---
+        cap.release()
+        st.session_state.live_camera_running = False
+        st.session_state.live_camera_status = "⏹️ Stopped"
+
+        # --- Auto-save aggregate inspection record ---
+        snapshots = st.session_state.live_stats["snapshots"]
+        all_dets = st.session_state.live_stats["all_detections"]
+        avg_conf = round(sum(d["confidence"] for d in all_dets) / max(1, len(all_dets)), 3) if all_dets else 0.0
+        if all_dets:
+            db.add_detection_record(
+                user_id=st.session_state.user["id"],
+                filename=snapshots[0] if snapshots else "live_inspection",
+                media_type="live",
+                location_country=loc_country,
+                location_state=loc_state,
+                location_city=loc_city,
+                location_area=loc_area,
+                location_road_name=loc_road,
+                latitude=loc_lat,
+                longitude=loc_lon,
+                total_potholes=st.session_state.live_stats["total_potholes"],
+                total_cracks=st.session_state.live_stats["total_cracks"],
+                critical_damages=st.session_state.live_stats["critical_damages"],
+                average_confidence=avg_conf,
+                condition_score=db.estimate_condition_score(all_dets),
+                detections_json=json.dumps(all_dets),
+            )
+
+        st.success("✅ Live inspection session completed. All detections auto-saved to history.")
+
+        # --- Post-session summary ---
+        if st.session_state.live_stats["critical_damages"] > 0:
+            st.markdown(f"""
+                <div style="background:rgba(239,68,68,0.12);border:2px solid #ef4444;border-radius:14px;
+                            padding:1.25rem 1.5rem;margin:1rem 0;">
+                    <div style="color:#ef4444;font-size:1rem;font-weight:800;margin-bottom:6px;">
+                        🚨 SESSION CRITICAL ALERT — Notification Center
+                    </div>
+                    <div style="color:#f8fafc;font-size:0.9rem;">
+                        <b>{st.session_state.live_stats['critical_damages']}</b> critical/high-severity events detected.<br>
+                        Location: <b>{loc_road or 'GPS: ' + loc_lat + ', ' + loc_lon}</b><br>
+                        Total Potholes: <b>{st.session_state.live_stats['total_potholes']}</b> &nbsp;|&nbsp;
+                        Total Cracks: <b>{st.session_state.live_stats['total_cracks']}</b><br>
+                        Total Detections: <b>{st.session_state.live_stats['total_detections']}</b> &nbsp;|&nbsp;
+                        Time: <b>{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</b>
+                    </div>
+                </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.success("✅ No critical road conditions detected during this session.")
+
+        # --- Post-session GIS Map ---
+        if loc_lat and loc_lon:
+            try:
+                lat_f = float(loc_lat)
+                lon_f = float(loc_lon)
+                st.markdown("#### 🗺️ Inspection Route — GIS Map")
+                m = folium.Map(location=[lat_f, lon_f], zoom_start=16, tiles="cartodbpositron")
+                for det in (all_dets or st.session_state.live_stats["last_detections"]):
+                    sev = det.get("severity", "Low")
+                    pin_color = "red" if sev == "Critical" else "orange" if sev == "High" else "blue"
+                    folium.CircleMarker(
+                        location=[lat_f, lon_f],
+                        radius=8,
+                        popup=f"{det['label']} — {det['confidence']*100:.1f}%",
+                        color=pin_color,
+                        fill=True,
+                        fill_color=pin_color,
+                        fill_opacity=0.7,
+                    ).add_to(m)
+                st_folium(m, height=380, use_container_width=True)
+            except Exception:
+                pass
+
+    # --- Detection History Table (always visible when there are detections) ---
+    if st.session_state.live_detection_history:
+        st.markdown("### 📋 Live Detection History")
+        hist_df = pd.DataFrame(st.session_state.live_detection_history)
+        # Reorder columns for better display
+        display_cols = ["time", "label", "confidence", "severity", "country", "state", "city", "road", "lat", "lon"]
+        display_cols = [c for c in display_cols if c in hist_df.columns]
+        hist_df_display = hist_df[display_cols].rename(columns={
+            "time": "Time", "label": "Damage Type", "confidence": "Confidence",
+            "severity": "Severity", "country": "Country", "state": "State",
+            "city": "City", "road": "Road", "lat": "Latitude", "lon": "Longitude"
+        })
+        st.dataframe(hist_df_display, use_container_width=True, height=min(300, 35 * len(hist_df_display) + 35))
+
+
+def gps_page():
+    st.header("GPS & Location Tracking")
+    st.write("Capture and manage precise location details for every inspection.")
+
+    # Ensure session state keys exist
+    for k in ("loc_lat", "loc_lon", "loc_country", "loc_state", "loc_district", "loc_city", "loc_area", "loc_road", "gps_last_updated"):
+        if k not in st.session_state:
+            st.session_state[k] = ""
+
+    # Try to get location via streamlit_js_eval
+    location = None
+    lat = None
+    lon = None
+    
+    try:
+        location = get_geolocation()
+    except Exception as e:
+        st.warning(f"Could not access browser geolocation: {str(e)}")
+        location = None
+
+    # Safely extract coordinates
+    if location and isinstance(location, dict):
+        try:
+            coords = location.get("coords")
+            if coords and isinstance(coords, dict):
+                lat = coords.get("latitude")
+                lon = coords.get("longitude")
+                if lat is not None and lon is not None:
+                    # Successfully got coordinates, now reverse geocode
+                    geo_info = reverse_geocode(lat, lon)
+                    st.session_state["loc_lat"] = str(lat)
+                    st.session_state["loc_lon"] = str(lon)
+                    st.session_state["loc_country"] = geo_info.get("country", "")
+                    st.session_state["loc_state"] = geo_info.get("state", "")
+                    st.session_state["loc_district"] = geo_info.get("district", "")
+                    st.session_state["loc_city"] = geo_info.get("city", "")
+                    st.session_state["loc_area"] = geo_info.get("area", "")
+                    st.session_state["loc_road"] = geo_info.get("road", "")
+                    st.session_state["gps_last_updated"] = datetime.datetime.now().isoformat()
+                    st.success("✓ Location detected and reverse-geocoded")
+            else:
+                st.warning("Coordinates not available in location response")
+        except Exception as e:
+            st.warning(f"Error processing location: {str(e)}")
+    elif location is None:
+        st.info("📍 Click 'Get Current Location' below to enable GPS, or enter coordinates manually")
+
+    # Display map if coordinates are available
+    if st.session_state.get("loc_lat") and st.session_state.get("loc_lon"):
+        try:
+            lat_display = float(st.session_state["loc_lat"])
+            lon_display = float(st.session_state["loc_lon"])
+            m = folium.Map(
+                location=[lat_display, lon_display],
+                zoom_start=16
+            )
+            folium.Marker(
+                [lat_display, lon_display],
+                popup="Current Location",
+                icon=folium.Icon(color="blue", icon="info-sign")
+            ).add_to(m)
+            st_folium(m, width=700, height=400)
+        except (ValueError, TypeError) as e:
+            st.warning(f"Could not render map: {str(e)}")
+
+    st.markdown("---")
+    st.subheader("Browser Geolocation")
+    st.markdown("Use the button below to request GPS from your browser. Requires location permission.")
+    components.html(
+        """
+        <button onclick="getLocation()" style="padding: 10px 16px; font-size: 14px; cursor: pointer; margin-bottom: 10px; background-color: #1f77b4; color: white; border: none; border-radius: 4px;">📍 Get Current Location</button>
+        <script>
+        function getLocation() {
+            if (!navigator.geolocation) {
+                alert('Geolocation not supported by your browser.');
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(
+                function(position) {
+                    const lat = position.coords.latitude;
+                    const lon = position.coords.longitude;
+                    const url = new URL(window.location.href);
+                    url.searchParams.set('geo_lat', lat);
+                    url.searchParams.set('geo_lon', lon);
+                    window.location.replace(url.toString());
+                },
+                function(error) {
+                    let msg = error.message;
+                    if (error.code === error.PERMISSION_DENIED)
+                        msg = 'Location permission denied. Enable in browser settings.';
+                    else if (error.code === error.POSITION_UNAVAILABLE)
+                        msg = 'Location not available.';
+                    else if (error.code === error.TIMEOUT)
+                        msg = 'Location request timed out.';
+                    alert('Location Error: ' + msg);
+                },
+                {enableHighAccuracy: true, timeout: 10000, maximumAge: 0}
+            );
+        }
+        </script>
+        """,
+        height=80,
+    )
+
+    st.markdown("---")
+    st.subheader("Location Details")
+    with st.form("gps_form"):
+        country = st.text_input("Country", value=st.session_state.get("loc_country", ""), key="loc_country_input")
+        state = st.text_input("State", value=st.session_state.get("loc_state", ""), key="loc_state_input")
+        district = st.text_input("District", value=st.session_state.get("loc_district", ""), key="loc_district_input")
+        city = st.text_input("City", value=st.session_state.get("loc_city", ""), key="loc_city_input")
+        area = st.text_input("Area", value=st.session_state.get("loc_area", ""), key="loc_area_input")
+        road_name = st.text_input("Road Name", value=st.session_state.get("loc_road", ""), key="loc_road_input")
+        latitude = st.text_input("Latitude", value=st.session_state.get("loc_lat", ""), key="loc_lat_input")
+        longitude = st.text_input("Longitude", value=st.session_state.get("loc_lon", ""), key="loc_lon_input")
+        save_location = st.form_submit_button("Save Location")
+
+    if save_location:
+        lat_val = str(latitude).strip()
+        lon_val = str(longitude).strip()
+        if not lat_val or not lon_val:
+            st.error("Please provide both latitude and longitude.")
+            return
+        try:
+            float(lat_val)
+            float(lon_val)
+        except Exception:
+            st.error("Please provide valid numeric latitude and longitude.")
+            return
+
+        location_id = db.add_location(
+            user_id=st.session_state.user["id"],
+            country=country.strip(),
+            state=state.strip(),
+            district=district.strip(),
+            city=city.strip(),
+            area=area.strip(),
+            road_name=road_name.strip(),
+            latitude=lat_val,
+            longitude=lon_val,
+        )
+        st.success(f"Location saved successfully (ID: {location_id}).")
+
+        locations = db.get_locations(st.session_state.user["id"])
+
+    # Display saved locations
+    locations = db.get_locations(st.session_state.user["id"])
+    if locations:
+        st.markdown("### Saved Locations")
+        cols = ["ID", "User ID", "Country", "State", "District", "City", "Area", "Road Name", "Latitude", "Longitude", "Added On"]
+        df = pd.DataFrame(locations, columns=cols)
+        st.dataframe(df)
+
+        # Plot map if coordinates exist and are numeric
+        map_df = df[["Latitude", "Longitude"]].dropna()
+        map_df = map_df.apply(pd.to_numeric, errors="coerce").dropna()
+        if not map_df.empty:
+            try:
+                st.map(map_df)
+            except Exception:
+                st.info("Unable to render map for saved locations.")
+
+
+def history_page():
+    st.header("📋 Detection History")
+    st.write("Review all past image inspections with filtering and search.")
+
+    # --- Load all image detection events ---
+    events = db.get_detection_events(st.session_state.user["id"], limit=5000)
+    event_cols = ["ID", "User ID", "Time", "Damage Type", "Confidence", "BBox",
+                  "Lat", "Lon", "Country", "State", "District", "City", "Area", "Road", "Screenshot", "Source"]
+
+    # Also load aggregate records for stats
+    records = db.get_detection_history(st.session_state.user["id"])
+
+    # --- Statistics Cards ---
+    image_records = [r for r in records if r[3] == "image"] if records else []
+    img_events = [e for e in events if e[15] == "Image"] if events else []
+
+    total_images = len(image_records)
+    total_potholes = sum(r[10] or 0 for r in image_records)
+    total_cracks = sum(r[11] or 0 for r in image_records)
+    avg_conf_val = 0.0
+    if img_events:
+        confs = [float(e[4]) for e in img_events if e[4] is not None]
+        avg_conf_val = round(sum(confs) / len(confs) * 100, 1) if confs else 0.0
+
+    st.markdown("### 📊 Statistics")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("🖼️ Total Images Processed", total_images)
+    s2.metric("🕳️ Total Potholes Detected", total_potholes)
+    s3.metric("🪨 Total Cracks Detected", total_cracks)
+    s4.metric("🎯 Average Confidence", f"{avg_conf_val}%")
+
+    st.markdown("---")
+
+    if not img_events:
+        st.info("No image detection history found. Upload an image to get started.")
+        return
+
+    event_df = pd.DataFrame(img_events, columns=event_cols)
+    event_df["Confidence %"] = (event_df["Confidence"].astype(float) * 100).round(1)
+    event_df["Image File"] = event_df["Screenshot"].apply(lambda p: os.path.basename(p) if p else "N/A")
+
+    # --- Filters ---
+    st.markdown("### 🔎 Filter & Search")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        all_types = ["All"] + sorted(event_df["Damage Type"].dropna().unique().tolist())
+        filter_type = st.selectbox("Filter by Damage Type", all_types, key="hist_filter_type")
+    with f2:
+        min_date = pd.to_datetime(event_df["Time"]).dt.date.min()
+        max_date = pd.to_datetime(event_df["Time"]).dt.date.max()
+        filter_date = st.date_input("Filter by Date", value=None, min_value=min_date, max_value=max_date, key="hist_filter_date")
+    with f3:
+        search_file = st.text_input("Search by Image Filename", placeholder="e.g. road_01.jpg", key="hist_search_file")
+
+    filtered_df = event_df.copy()
+    if filter_type != "All":
+        filtered_df = filtered_df[filtered_df["Damage Type"] == filter_type]
+    if filter_date:
+        filtered_df = filtered_df[pd.to_datetime(filtered_df["Time"]).dt.date == filter_date]
+    if search_file.strip():
+        filtered_df = filtered_df[filtered_df["Image File"].str.contains(search_file.strip(), case=False, na=False)]
+
+    st.markdown(f"### 🗂️ Detection Records ({len(filtered_df)} results)")
+
+    # Build display table
+    display_df = filtered_df[["ID", "Time", "Damage Type", "Confidence %", "Image File"]].rename(columns={
+        "ID": "Detection ID",
+        "Time": "Date & Time",
+        "Damage Type": "Damage Type",
+        "Confidence %": "Confidence (%)",
+        "Image File": "Image Filename",
+    })
+    st.dataframe(display_df, use_container_width=True)
+
+    # --- View Image for selected event ---
+    if not filtered_df.empty:
+        st.markdown("### 🖼️ View Detection Image")
+        sel_id = st.selectbox("Select Detection ID to view image", filtered_df["ID"].tolist(), key="hist_sel_event")
+        sel_row = filtered_df[filtered_df["ID"] == sel_id]
+        if not sel_row.empty:
+            sel = sel_row.iloc[0]
+            shot_path = sel["Screenshot"]
+            if shot_path and os.path.exists(shot_path):
+                st.image(shot_path, caption=f"{sel['Damage Type']} — {sel['Confidence %']}% confidence at {sel['Time']}", use_column_width=True)
+            else:
+                st.info("Screenshot not available for this event.")
+
+    # --- Aggregate inspection records (all types) still accessible below ---
+    if records:
+        with st.expander("📁 All Inspection Records (Images, Video, Live)"):
+            history_data = []
+            for record in records:
+                history_data.append({
+                    "ID": record[0],
+                    "Date": record[8],
+                    "Type": record[3],
+                    "File": os.path.basename(record[2]),
+                    "Potholes": record[10],
+                    "Cracks": record[11],
+                    "Critical": record[12],
+                    "Condition Score": record[16],
+                })
+            df = pd.DataFrame(history_data)
+            st.dataframe(df, use_container_width=True)
+
+            selected = st.selectbox("Select record ID to inspect details", df["ID"].tolist(), key="hist_agg_select")
+            record = db.get_detection_by_id(selected)
+            if record:
+                st.markdown("**Record Details**")
+                location_display = f"{record[4] or 'N/A'}, {record[5] or 'N/A'}, {record[6] or 'N/A'}, {record[7] or 'N/A'}"
+                st.write({
+                    "File": record[2], "Type": record[3],
+                    "Location": location_display, "Road Name": record[9],
+                    "GPS": f"{record[17] or 'N/A'}, {record[18] or 'N/A'}",
+                    "Added": record[8], "Potholes": record[10],
+                    "Cracks": record[11], "Critical": record[12],
+                    "Condition Score": record[16],
+                })
+                try:
+                    st.map(pd.DataFrame([{"latitude": float(record[17]), "longitude": float(record[18])}]))
+                except Exception:
+                    pass
+
+
+def analytics_page():
+    st.header("Analytics Dashboard")
+    metrics = db.get_dashboard_metrics(st.session_state.user["id"])
+    st.write("Aggregate insights and trend analysis for road damage monitoring.")
+
+    stat_cols = st.columns(4)
+    stat_cols[0].metric("Road Condition Score", f"{metrics['road_condition_score']}%")
+    stat_cols[1].metric("Images Processed", metrics["image_inspections"])
+    stat_cols[2].metric("Videos Processed", metrics["video_inspections"])
+    stat_cols[3].metric("Critical Events", metrics["critical_damages"])
+
+    records = db.get_detection_history(st.session_state.user["id"])
+    if records:
+        df = pd.DataFrame([
+            {
+                "inspection_date": row[8],
+                "potholes": row[10],
+                "cracks": row[11],
+                "critical": row[12],
+                "score": row[16],
+                "latitude": row[17],
+                "longitude": row[18],
+            }
+            for row in records
+        ])
+        df["inspection_date"] = pd.to_datetime(df["inspection_date"])
+        fig1 = px.line(df, x="inspection_date", y=["potholes", "cracks"], title="Damage Counts Over Time")
+        fig2 = px.pie(df, names="critical", values="potholes", title="Critical Event Breakdown")
+        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig2, use_container_width=True)
+
+        if not df.empty:
+            fig3 = px.histogram(df, x="score", nbins=5, title="Road Condition Score Distribution")
+            st.plotly_chart(fig3, use_container_width=True)
+
+        map_df = df[["latitude", "longitude"]].dropna()
+        if not map_df.empty:
+            map_df = map_df.apply(pd.to_numeric, errors="coerce").dropna()
+            if not map_df.empty:
+                st.markdown("### Inspection Locations")
+                st.map(map_df)
+    else:
+        st.info("No analytics available until detection results are recorded.")
+
+
+def report_generation_page():
+    st.header("Report Generation")
+    records = db.get_detection_history(st.session_state.user["id"])
+    if not records:
+        st.info("No detection records available to generate reports.")
+        return
+
+    record_options = {f"{row[0]} - {os.path.basename(row[2])} ({row[8]})": row[0] for row in records}
+    selected_option = st.selectbox("Select inspection record", list(record_options.keys()))
+    record_id = record_options[selected_option]
+    record = db.get_detection_by_id(record_id)
+    if record:
+        detections = json.loads(record["detections_json"] or "[]")
+        report_meta = {
+            "user_name": st.session_state.user["full_name"],
+            "inspection_date": record["created_at"],
+            "location": {
+                "country": record["location_country"],
+                "state": record["location_state"],
+                "city": record["location_city"],
+                "area": record["location_area"],
+                "road_name": record["location_road_name"],
+                "latitude": record["latitude"],
+                "longitude": record["longitude"],
+            },
+            "file_name": os.path.basename(record["filename"]),
+            "full_path": record["filename"],
+            "total_potholes": record["total_potholes"],
+            "total_cracks": record["total_cracks"],
+            "critical_damages": record["critical_damages"],
+            "condition_score": record["condition_score"],
+            "detections": detections,
+        }
+        pdf_path = Path("reports") / f"report_{record_id}.pdf"
+        excel_path = Path("reports") / f"report_{record_id}.xlsx"
+        if st.button("Generate PDF Report"):
+            reporter.generate_pdf_report(report_meta, pdf_path)
+            st.success("PDF report generated.")
+            st.download_button("Download PDF", data=open(pdf_path, "rb"), file_name=pdf_path.name, mime="application/pdf")
+        if st.button("Generate Excel Report"):
+            reporter.generate_excel_report(report_meta, excel_path)
+            st.success("Excel report generated.")
+            st.download_button("Download Excel", data=open(excel_path, "rb"), file_name=excel_path.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+def profile_page():
+    st.header("User Profile")
+    user = st.session_state.user
+    st.write(f"**Name:** {user['full_name']}")
+    st.write(f"**Email:** {user['email']}")
+    st.write(f"**Mobile:** {user['mobile']}")
+    st.write(f"**Department:** {user['department']}")
+    st.write("\n")
+    st.write("Update your profile in Settings.")
+
+
+def settings_page():
+    st.header("Settings")
+    st.write("Configure application settings and model details.")
+    model_path = st.text_input("YOLOv8 model path", value=str(config.get("model_path", MODEL_PATH)), key="setting_model_path")
+    if st.button("Save Settings"):
+        config["model_path"] = model_path
+        save_config(config)
+        detector.model_path = Path(model_path)
+        detector.load_model()
+        if detector.is_ready:
+            st.success("Settings saved and YOLO model loaded successfully.")
+        else:
+            st.warning("Settings saved, but model could not be loaded. Check the model path.")
+
+    st.markdown("### Upload YOLOv8 Weights")
+    st.write("If you do not have a local model file yet, upload it here and the app will save it to the `models/` directory.")
+    uploaded_model = st.file_uploader("Upload YOLOv8 model (.pt)", type=["pt"], key="upload_model")
+    if uploaded_model:
+        target_path = Path("models") / uploaded_model.name
+        with open(target_path, "wb") as f:
+            f.write(uploaded_model.getbuffer())
+        config["model_path"] = str(target_path)
+        save_config(config)
+        detector.model_path = target_path
+        detector.load_model()
+        if detector.is_ready:
+            st.success(f"Model uploaded and loaded: {uploaded_model.name}")
+        else:
+            st.error(f"Model uploaded but could not be loaded. Check that this file is a valid YOLOv8 `.pt` weights file.")
+
+    st.markdown("### Model Classes")
+    st.write(", ".join(ROAD_DAMAGE_CLASSES))
+
+    st.markdown("### Road Damage Model Setup")
+    st.write(
+        "If you don't yet have a road damage model, upload `models/best.pt` here or train a YOLOv8 model using a road damage dataset."
+    )
+    st.write("Recommended class labels: Pothole, Longitudinal Crack, Transverse Crack, Alligator Crack, Surface Damage, Road Deterioration.")
+    st.markdown(
+        "#### Training Guidance\n"
+        "- Download the RDD dataset or a road damage dataset from GitHub/Kaggle.\n"
+        "- Prepare a `data.yaml` file with class names and train/val paths.\n"
+        "- Use YOLOv8 training: `yolo task=detect mode=train model=yolov8n.pt data=data.yaml epochs=100 imgsz=640`\n"
+        "- After training, place the new weights in `models/` and update the model path above."
+    )
+
+
+def logout_page():
+    st.session_state.authenticated = False
+    st.session_state.user = None
+    st.session_state.nav = "Home"
+    st.success("You have been logged out.")
+
+
+# Main application entrypoint
+if not st.session_state.authenticated:
+    login_form()
+else:
+    sidebar_navigation()
+    page = st.session_state.nav
+    if page == "Home":
+        show_home()
+    elif page == "Upload Image":
+        image_detection_page()
+    elif page == "Upload Video":
+        video_detection_page()
+    elif page == "Live Camera Detection":
+        live_detection_page()
+    elif page == "GPS & Location Tracking":
+        gps_page()
+    elif page == "Detection History":
+        history_page()
+    elif page == "Analytics Dashboard":
+        analytics_page()
+    elif page == "Report Generation":
+        report_generation_page()
+    elif page == "User Profile":
+        profile_page()
+    elif page == "Settings":
+        settings_page()
+    elif page == "Logout":
+        logout_page()

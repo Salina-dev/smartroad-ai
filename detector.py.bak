@@ -1,0 +1,372 @@
+import os
+from pathlib import Path
+import cv2
+import numpy as np
+import math
+from typing import List, Dict
+
+DEFAULT_MODEL_PATH = "models/best.pt"
+
+ROAD_DAMAGE_CLASSES = [
+    "Pothole",
+    "Longitudinal Crack",
+    "Transverse Crack",
+    "Alligator Crack",
+    "Surface Damage",
+    "Road Deterioration",
+]
+
+MODEL_LABEL_MAP = {
+    "d00": "Longitudinal Crack",
+    "d10": "Transverse Crack",
+    "d20": "Alligator Crack",
+    "d40": "Pothole",
+    "d01": "Surface Damage",
+    "d11": "Road Deterioration",
+}
+
+
+def normalize_class_name(raw_name: str) -> str:
+    if raw_name is None:
+        return "Unknown Damage"
+    key = str(raw_name).strip().lower()
+    if key in MODEL_LABEL_MAP:
+        return MODEL_LABEL_MAP[key]
+    if "pothole" in key:
+        return "Pothole"
+    if "longitudinal" in key:
+        return "Longitudinal Crack"
+    if "transverse" in key:
+        return "Transverse Crack"
+    if "alligator" in key:
+        return "Alligator Crack"
+    if "surface" in key:
+        return "Surface Damage"
+    if "deterioration" in key or "road" in key:
+        return "Road Deterioration"
+    return str(raw_name).replace("_", " ").title()
+
+
+class RoadDamageDetector:
+    def __init__(self, model_path=None, device="cpu"):
+        model_path = model_path or DEFAULT_MODEL_PATH
+        self.model_path = Path(model_path)
+        self.model_name = self.model_path.name
+        self.device = device
+        self.model = None
+        self.class_names = ROAD_DAMAGE_CLASSES
+        self.raw_class_names = []
+        self.is_ready = False
+        self.last_error = None
+        self.last_prediction = None
+        self.load_model()
+
+    def load_model(self):
+        try:
+            from ultralytics import YOLO
+
+            if not self.model_path.exists():
+                self.model = None
+                self.is_ready = False
+                self.last_error = f"Model file not found: {self.model_path}"
+                print(f"[detector] {self.last_error}")
+                return
+
+            self.model = YOLO(str(self.model_path))
+            self.class_names = self._build_class_names(self.model)
+            self.is_ready = True
+            self.last_error = None
+            self.last_prediction = None
+            print(f"[detector] Loaded model path: {self.model_path}")
+            print(f"[detector] Raw model names: {self.raw_class_names}")
+        except Exception as exc:
+            self.model = None
+            self.is_ready = False
+            self.last_error = str(exc)
+            self.last_prediction = None
+            print(f"[detector] Model load error: {self.last_error}")
+
+    def _build_class_names(self, model):
+        if hasattr(model, "names") and model.names:
+            names = model.names
+            if isinstance(names, dict):
+                names = [names[index] for index in sorted(names)]
+            self.raw_class_names = [str(raw) for raw in names]
+            mapped_names = [normalize_class_name(raw) for raw in names]
+            if len(mapped_names) == len(ROAD_DAMAGE_CLASSES):
+                return mapped_names
+            return mapped_names
+        self.raw_class_names = []
+        return ROAD_DAMAGE_CLASSES
+
+    def predict(self, frame, conf=0.15, imgsz=640, resize_max=None, device=None):
+        if not self.is_ready or self.model is None:
+            self.last_prediction = {
+                "model_path": str(self.model_path),
+                "model_name": self.model_name,
+                "error": "Model not ready",
+            }
+            return []
+
+        if frame is None:
+            self.last_prediction = {
+                "model_path": str(self.model_path),
+                "model_name": self.model_name,
+                "error": "No frame provided",
+            }
+            print(f"[detector] No frame provided for prediction.")
+            return []
+
+        try:
+            source = frame
+            if isinstance(frame, np.ndarray) and frame.ndim == 3:
+                source = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if resize_max is not None:
+                    height, width = source.shape[:2]
+                    max_dim = max(height, width)
+                    if max_dim > resize_max:
+                        scale = resize_max / float(max_dim)
+                        target_size = (int(width * scale), int(height * scale))
+                        source = cv2.resize(source, target_size, interpolation=cv2.INTER_LINEAR)
+
+            model_device = self.device if device is None else device
+            results = self.model.predict(source=source, conf=conf, imgsz=imgsz, device=model_device)[0]
+            print("YOLO Results:", results)
+            print("Boxes:", len(results.boxes))
+            raw_boxes = []
+            if hasattr(results.boxes, "data"):
+                raw_boxes = results.boxes.data.cpu().numpy().tolist()
+
+            debug_results = {
+                "model_path": str(self.model_path),
+                "model_name": self.model_name,
+                "raw_class_names": self.raw_class_names,
+                "mapped_class_names": self.class_names,
+                "boxes_count": 0,
+                "class_ids": [],
+                "confidence_scores": [],
+                "raw_results": [],
+                "raw_yolo_boxes": raw_boxes,
+                "raw_results_repr": repr(results),
+            }
+
+            print(f"[detector] Model path: {self.model_path}")
+            print(f"[detector] Raw model names: {self.raw_class_names}")
+            print(f"[detector] YOLO raw boxes: {raw_boxes}")
+            print(f"[detector] YOLO results repr: {repr(results)}")
+
+            detections = []
+            boxes = results.boxes.xyxy if hasattr(results.boxes, "xyxy") else []
+            classes = results.boxes.cls if hasattr(results.boxes, "cls") else []
+            confidences = results.boxes.conf if hasattr(results.boxes, "conf") else []
+
+            debug_results["boxes_count"] = len(boxes)
+            if len(boxes) == 0:
+                print(f"[detector] No boxes detected for model {self.model_name} at conf=0.05, imgsz=1280.")
+
+            for box, cls, conf in zip(boxes, classes, confidences):
+                x1, y1, x2, y2 = [int(coord) for coord in box.cpu().numpy().tolist()]
+                class_id = int(cls.cpu().numpy())
+                confidence = float(conf.cpu().numpy())
+                label = self.class_names[class_id] if class_id < len(self.class_names) else f"Damage {class_id}"
+                severity = self.classify_severity(x1, y1, x2, y2, confidence, label)
+
+                debug_results["class_ids"].append(class_id)
+                debug_results["confidence_scores"].append(confidence)
+                debug_results["raw_results"].append(
+                    {
+                        "bbox": [x1, y1, x2, y2],
+                        "class_id": class_id,
+                        "label": label,
+                        "confidence": confidence,
+                        "severity": severity,
+                    }
+                )
+
+                print(f"[detector] Detected box: {debug_results['raw_results'][-1]}")
+
+                detections.append(
+                    {
+                        "label": label,
+                        "confidence": confidence,
+                        "severity": severity,
+                        "bbox": [x1, y1, x2, y2],
+                    }
+                )
+
+            self.last_prediction = debug_results
+            print(f"[detector] Prediction summary: boxes={debug_results['boxes_count']}, ids={debug_results['class_ids']}, scores={debug_results['confidence_scores']}")
+            return detections
+        except Exception as exc:
+            self.last_prediction = {
+                "model_path": str(self.model_path),
+                "model_name": self.model_name,
+                "error": str(exc),
+            }
+            print(f"[detector] Prediction error: {exc}")
+            return []
+
+    def detect_image(self, image_path):
+        image = cv2.imread(str(image_path))
+        if image is None:
+            return []
+        return self.predict(image)
+
+    def detect_frame(self, frame, conf=0.15, imgsz=640, resize_max=640, device=None):
+        return self.predict(frame, conf=conf, imgsz=imgsz, resize_max=resize_max, device=device)
+
+
+def _iou(boxA, boxB):
+    # boxes are [x1,y1,x2,y2]
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    boxAArea = max(0, boxA[2] - boxA[0]) * max(0, boxA[3] - boxA[1])
+    boxBArea = max(0, boxB[2] - boxB[0]) * max(0, boxB[3] - boxB[1])
+    denom = float(boxAArea + boxBArea - interArea)
+    if denom <= 0:
+        return 0.0
+    return interArea / denom
+
+
+class SimpleTracker:
+    def __init__(self, iou_threshold=0.3, max_lost=30):
+        self.next_id = 1
+        self.tracks: Dict[int, Dict] = {}
+        self.iou_threshold = iou_threshold
+        self.max_lost = max_lost
+
+    def update(self, detections: List[Dict], frame_idx: int = 0):
+        # detections: list of dicts with 'bbox' and 'label'
+        for det in detections:
+            best_id = None
+            best_iou = 0.0
+            for tid, t in list(self.tracks.items()):
+                if t.get('label') != det.get('label'):
+                    continue
+                i = _iou(det['bbox'], t['bbox'])
+                if i > best_iou:
+                    best_iou = i
+                    best_id = tid
+
+            if best_iou >= self.iou_threshold and best_id is not None:
+                # update existing track
+                self.tracks[best_id]['bbox'] = det['bbox']
+                self.tracks[best_id]['last_seen'] = frame_idx
+                self.tracks[best_id]['lost'] = 0
+                det['track_id'] = best_id
+            else:
+                # create new track
+                tid = self.next_id
+                self.next_id += 1
+                self.tracks[tid] = {
+                    'bbox': det['bbox'],
+                    'label': det.get('label'),
+                    'last_seen': frame_idx,
+                    'lost': 0,
+                }
+                det['track_id'] = tid
+
+        # age tracks
+        for tid in list(self.tracks.keys()):
+            if self.tracks[tid]['last_seen'] < frame_idx:
+                self.tracks[tid]['lost'] += 1
+            if self.tracks[tid]['lost'] > self.max_lost:
+                del self.tracks[tid]
+
+        return detections
+
+    def process_video(self, video_path, output_path, progress_callback=None):
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise RuntimeError("Unable to open video file.")
+
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+
+        total_potholes = 0
+        total_cracks = 0
+        critical_damages = 0
+        confidences = []
+        records = []
+        processed = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            detections = self.detect_frame(frame)
+            for item in detections:
+                x1, y1, x2, y2 = item["bbox"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 160, 255), 2)
+                cv2.putText(
+                    frame,
+                    f"{item['label']} {item['confidence']*100:.1f}%",
+                    (x1, max(20, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                )
+                if item["label"] == "Pothole":
+                    total_potholes += 1
+                if "Crack" in item["label"]:
+                    total_cracks += 1
+                if item["severity"] == "Critical":
+                    critical_damages += 1
+                confidences.append(item["confidence"])
+                records.append(item)
+
+            writer.write(frame)
+            processed += 1
+            if progress_callback and frame_count > 0:
+                progress_callback.progress(int(processed / frame_count * 100))
+
+        cap.release()
+        writer.release()
+
+        return {
+            "total_frames": processed,
+            "total_potholes": total_potholes,
+            "total_cracks": total_cracks,
+            "critical_damages": critical_damages,
+            "average_confidence": round(sum(confidences) / max(1, len(confidences)), 3),
+            "road_condition_score": self.estimate_condition_score(records),
+            "detections": records,
+        }
+
+    def classify_severity(self, x1, y1, x2, y2, confidence, label):
+        width = x2 - x1
+        height = y2 - y1
+        area = width * height
+        if area > 25000 or confidence > 0.85:
+            return "Critical"
+        if area > 10000 or confidence > 0.65:
+            return "High"
+        if area > 3500 or confidence > 0.45:
+            return "Medium"
+        return "Low"
+
+    def estimate_condition_score(self, detections):
+        if not detections:
+            return 100
+        score = 100
+        for item in detections:
+            if item["severity"] == "Low":
+                score -= 5
+            elif item["severity"] == "Medium":
+                score -= 15
+            elif item["severity"] == "High":
+                score -= 30
+            elif item["severity"] == "Critical":
+                score -= 45
+        return max(10, min(100, score))
