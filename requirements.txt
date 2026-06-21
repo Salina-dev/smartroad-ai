@@ -10,3 +10,6 @@ reportlab>=3.6.0
 streamlit-js-eval
 streamlit-webrtc
 av
+aiortc
+aioice
+numpy
