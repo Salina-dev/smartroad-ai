@@ -1491,7 +1491,7 @@ def live_detection_page():
     video_processor_factory=RoadDamageVideoProcessor,
     media_stream_constraints={
         "video": {
-            "facingMode": {"ideal": "environment"}
+            "facingMode": "environment"
         },
         "audio": False
     }
