@@ -942,20 +942,43 @@ class RoadDamageVideoProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         detections = self._detector.detect_frame(img, resize_max=640)
         if detections:
-            img = self._detector.draw_detections(img, detections)
-            # Store detections in session state for the main thread to process alerts
-            # Only update every 30 frames to avoid overwhelming the UI thread
-            self._frame_count += 1
-            if self._frame_count % 30 == 0:
-                try:
-                    st.session_state["live_new_detections"] = detections
-                    st.session_state["live_alert_time"] = datetime.datetime.now().isoformat()
-                except Exception:
-                    pass
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+                         img = self._detector.draw_detections(img, detections)
+
+                         self._frame_count += 1
+
+                         if self._frame_count % 30 == 0:
+                                try:
+                                     st.session_state["live_new_detections"] = detections
+                                     st.session_state["damage_detected"] = True
+                                     st.session_state["last_damage"] = detections[0]["label"]
+                                     st.session_state["live_alert_time"] = datetime.datetime.now()
+                                except Exception:
+                                    pass
+                                 # Store detections in session state for the main thread to process alerts
+                                 # Only update every 30 frames to avoid overwhelming the UI thread
+                                
+                                    return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 def live_detection_page():
+    if st.session_state.get("damage_detected", False):
+
+     for i in range(5):
+        st.error(
+            f"🚨 ROAD DAMAGE DETECTED: {st.session_state.get('last_damage', 'Unknown')}"
+        )
+
+    st.toast(
+        f"🚨 {st.session_state.get('last_damage', 'Damage')} detected!"
+    )
+
+    st.markdown("""
+    <audio autoplay>
+        <source src="https://www.soundjay.com/buttons/sounds/beep-07.mp3" type="audio/mpeg">
+    </audio>
+    """, unsafe_allow_html=True)
+
+    st.session_state["damage_detected"] = False
     # ─── PREMIUM SaaS DASHBOARD CSS (High Contrast v2) ──────────────────
     st.markdown("""
     <style>
@@ -1464,11 +1487,15 @@ def live_detection_page():
 
             # WebRTC Stream
             ctx = webrtc_streamer(
-                key="road-camera",
-                video_processor_factory=RoadDamageVideoProcessor,
-                media_stream_constraints={"video": True, "audio": False},
-                async_processing=True,
-            )
+    key="road-camera",
+    video_processor_factory=RoadDamageVideoProcessor,
+    media_stream_constraints={
+        "video": {
+            "facingMode": {"ideal": "environment"}
+        },
+        "audio": False
+    }
+)
 
             if ctx.video_processor:
                 st.markdown("<div class='cam-status-active'><span style='color:#22C55E;font-size:1.2rem;'>●</span><span style='color:#111827;font-size:0.85rem;font-weight:600;'>Camera feed active — road damage detection running in real-time</span></div>", unsafe_allow_html=True)
