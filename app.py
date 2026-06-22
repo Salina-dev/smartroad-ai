@@ -32,7 +32,7 @@ from reportlab.pdfgen import canvas
 from db import Database
 from detector import RoadDamageDetector, ROAD_DAMAGE_CLASSES
 from report_generator import ReportGenerator
-from notifications import check_detections, reset_dedup, init_notification_system
+from notifications import check_detections, reset_dedup, init_notification_system, unlock_audio_on_gesture
 
 # App configuration
 st.set_page_config(
@@ -1012,6 +1012,7 @@ def live_detection_page():
     # Show damage detected alerts (from the queue-driven session state update above)
     if st.session_state.get("damage_detected", False):
         print(f"[LIVE] Alert triggered: {st.session_state.get('last_damage', 'Unknown')}")
+        # Sound alert is handled by check_detections() -> _play_alert_sound() below
         for i in range(5):
             st.error(
                 f"🚨 ROAD DAMAGE DETECTED: {st.session_state.get('last_damage', 'Unknown')}"
@@ -1019,13 +1020,8 @@ def live_detection_page():
         st.toast(
             f"🚨 {st.session_state.get('last_damage', 'Damage')} detected!"
         )
-        st.markdown("""
-        <audio autoplay>
-            <source src="https://www.soundjay.com/buttons/sounds/beep-07.mp3" type="audio/mpeg">
-        </audio>
-        """, unsafe_allow_html=True)
-        print(f"[LIVE] Sound alert played for {st.session_state.get('last_damage')}")
         st.session_state["damage_detected"] = False
+        print(f"[LIVE] Visual alert shown")
 
     # ─── PREMIUM SaaS DASHBOARD CSS (High Contrast v2) ──────────────────
     st.markdown("""
@@ -1461,6 +1457,8 @@ def live_detection_page():
     if st.session_state.get("start_live_btn", False) or 'start_live_trigger' not in st.session_state:
         pass
     if 'start_live_btn' in st.session_state and st.session_state.start_live_btn and not st.session_state.live_inspection_active:
+        # Unlock audio on this user gesture before GPS redirect / rerun
+        unlock_audio_on_gesture()
         components.html(
             """<script>
             (function(){
@@ -1725,6 +1723,7 @@ def live_detection_page():
                     </div>
                     """
                 feed_html += "</div>"
+                
                 st.markdown(feed_html, unsafe_allow_html=True)
             else:
                 st.markdown("<div style='padding:20px;text-align:center;color:#64748b;font-size:0.85rem;'>No detections yet<br><span style='font-size:0.75rem;'>Start the camera to begin monitoring</span></div>", unsafe_allow_html=True)
