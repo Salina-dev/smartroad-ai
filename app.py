@@ -1,5 +1,7 @@
 import os
 import csv
+import queue
+import threading
 import time
 import tempfile
 import datetime
@@ -43,6 +45,12 @@ st.set_page_config(
 DB_PATH = Path("smartroad.db")
 CONFIG_PATH = Path("config.json")
 DEFAULT_MODEL_PATH = Path("models/best.pt")
+
+# ─── Thread-safe detection queue ───────────────────────────────────────
+# CRITICAL: st.session_state is NOT thread-safe. The WebRTC video processor
+# runs in a worker thread. We use a queue to pass detections from the worker
+# thread to the main Streamlit UI thread.
+_detection_queue = queue.Queue()
 
 def load_config():
     if CONFIG_PATH.exists():
@@ -942,43 +950,83 @@ class RoadDamageVideoProcessor(VideoProcessorBase):
         img = frame.to_ndarray(format="bgr24")
         detections = self._detector.detect_frame(img, resize_max=640)
         if detections:
-                         img = self._detector.draw_detections(img, detections)
-
-                         self._frame_count += 1
-
-                         if self._frame_count % 30 == 0:
-                                try:
-                                     st.session_state["live_new_detections"] = detections
-                                     st.session_state["damage_detected"] = True
-                                     st.session_state["last_damage"] = detections[0]["label"]
-                                     st.session_state["live_alert_time"] = datetime.datetime.now()
-                                except Exception:
-                                    pass
-                                 # Store detections in session state for the main thread to process alerts
-                                 # Only update every 30 frames to avoid overwhelming the UI thread
-                                
-                                    return av.VideoFrame.from_ndarray(img, format="bgr24")
+            img = self._detector.draw_detections(img, detections)
+            self._frame_count += 1
+            if self._frame_count % 30 == 0:
+                # Use thread-safe queue instead of st.session_state
+                # st.session_state is NOT thread-safe!
+                print(f"[LIVE] Detection received: {len(detections)} detection(s)")
+                for d in detections:
+                    print(f"[LIVE]   Class: {d.get('label','?')}, Confidence: {d.get('confidence',0):.3f}")
+                try:
+                    _detection_queue.put(detections)
+                    print(f"[LIVE] Detection queued successfully (queue size: {_detection_queue.qsize()})")
+                except Exception as e:
+                    print(f"[LIVE] Failed to queue detection: {e}")
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 def live_detection_page():
+    # Poll the thread-safe queue for detections from the WebRTC worker thread
+    try:
+        while not _detection_queue.empty():
+            detections = _detection_queue.get_nowait()
+            print(f"[LIVE] Processing {len(detections)} detections from queue for alerts")
+            st.session_state["live_new_detections"] = detections
+            st.session_state["damage_detected"] = True
+            if detections:
+                st.session_state["last_damage"] = detections[0].get("label", "Unknown")
+                st.session_state["live_alert_time"] = datetime.datetime.now()
+
+            # Update live detection history in session state
+            if "live_detection_history" not in st.session_state:
+                st.session_state.live_detection_history = []
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            for d in detections:
+                st.session_state.live_detection_history.append({
+                    "label": d.get("label", "Unknown"),
+                    "confidence": f"{d.get('confidence',0)*100:.1f}%",
+                    "severity": d.get("severity", "Low"),
+                    "time": now_str,
+                    "road": st.session_state.get("loc_road", ""),
+                    "city": st.session_state.get("loc_city", ""),
+                })
+
+            # Update live stats
+            if "live_stats" in st.session_state:
+                stats = st.session_state.live_stats
+                stats["total_detections"] += len(detections)
+                for d in detections:
+                    label = d.get("label", "")
+                    if "pothole" in label.lower():
+                        stats["total_potholes"] += 1
+                    elif "crack" in label.lower():
+                        stats["total_cracks"] += 1
+                    sev = d.get("severity", "Low")
+                    if sev == "Critical":
+                        stats["critical_damages"] += 1
+
+    except Exception as e:
+        print(f"[LIVE] Queue poll error: {e}")
+
+    # Show damage detected alerts (from the queue-driven session state update above)
     if st.session_state.get("damage_detected", False):
-
-     for i in range(5):
-        st.error(
-            f"🚨 ROAD DAMAGE DETECTED: {st.session_state.get('last_damage', 'Unknown')}"
+        print(f"[LIVE] Alert triggered: {st.session_state.get('last_damage', 'Unknown')}")
+        for i in range(5):
+            st.error(
+                f"🚨 ROAD DAMAGE DETECTED: {st.session_state.get('last_damage', 'Unknown')}"
+            )
+        st.toast(
+            f"🚨 {st.session_state.get('last_damage', 'Damage')} detected!"
         )
+        st.markdown("""
+        <audio autoplay>
+            <source src="https://www.soundjay.com/buttons/sounds/beep-07.mp3" type="audio/mpeg">
+        </audio>
+        """, unsafe_allow_html=True)
+        print(f"[LIVE] Sound alert played for {st.session_state.get('last_damage')}")
+        st.session_state["damage_detected"] = False
 
-    st.toast(
-        f"🚨 {st.session_state.get('last_damage', 'Damage')} detected!"
-    )
-
-    st.markdown("""
-    <audio autoplay>
-        <source src="https://www.soundjay.com/buttons/sounds/beep-07.mp3" type="audio/mpeg">
-    </audio>
-    """, unsafe_allow_html=True)
-
-    st.session_state["damage_detected"] = False
     # ─── PREMIUM SaaS DASHBOARD CSS (High Contrast v2) ──────────────────
     st.markdown("""
     <style>
@@ -1175,7 +1223,7 @@ def live_detection_page():
     /* ─── GPS Card ─── */
     .gps-card {
         background: #FFFFFF;
-        border-radius: 16px
+        border-radius: 16px;
         padding: 16px;
         box-shadow: 0 8px 24px rgba(37,99,235,0.2);
         transition: all 0.3s;
@@ -1485,42 +1533,53 @@ def live_detection_page():
             </div>
             """, unsafe_allow_html=True)
 
-            # WebRTC Stream
+            # WebRTC Camera Selector
             camera_option = st.selectbox(
-    "Select Camera",
-    ["Back Camera", "Front Camera"]
-)
+                "Select Camera",
+                ["Back Camera", "Front Camera"],
+                index=0
+            )
+            facing_mode = "environment" if camera_option == "Back Camera" else "user"
 
-facing_mode = "environment" if camera_option == "Back Camera" else "user"
+            # WebRTC Stream - single instance with proper facingMode
+            ctx = webrtc_streamer(
+                key="road-camera",
+                video_processor_factory=RoadDamageVideoProcessor,
+                media_stream_constraints={
+                    "video": {
+                        "width": {"ideal": 1280},
+                        "height": {"ideal": 720},
+                        "facingMode": facing_mode
+                    },
+                    "audio": False
+                }
+            )
 
-ctx = webrtc_streamer(
-    key="road-camera",
-    video_processor_factory=RoadDamageVideoProcessor,
-    media_stream_constraints={
-        "video": {
-            "facingMode": facing_mode
-        },
-        "audio": False
-    }
-)
-
-if ctx.video_processor:
-               st.markdown("<div class='cam-status-active'><span style='color:#22C55E;font-size:1.2rem;'>●</span><span style='color:#111827;font-size:0.85rem;font-weight:600;'>Camera feed active — road damage detection running in real-time</span></div>", unsafe_allow_html=True)
+            # Camera status indicator
+            if ctx.video_processor:
+                st.markdown(
+                    "<div class='cam-status-active'>✅ Camera Active</div>",
+                    unsafe_allow_html=True
+                )
             else:
-                st.markdown("<div class='cam-status-waiting'><span style='color:#2563EB;font-size:1rem;'>ℹ️</span><span style='color:#6B7280;font-size:0.85rem;'>Click <strong>START</strong> on the WebRTC panel to begin streaming</span></div>", unsafe_allow_html=True)
+                st.markdown(
+                    "<div class='cam-status-waiting'>⏳ Waiting for Camera</div>",
+                    unsafe_allow_html=True
+                )
 
-            st.markdown("</div>", unsafe_allow_html=True)
-
-            # ── Alert Polling: Process detections from WebRTC processor ──
+            # Alert Polling: Process detections passed from queue to session_state
             if "live_new_detections" in st.session_state and st.session_state.live_new_detections:
                 dets = st.session_state.live_new_detections
-                print(f"[live] Processing {len(dets)} detections from WebRTC processor for alerts")
+                print(f"[LIVE] Calling check_detections for {len(dets)} detection(s)")
+                for d in dets:
+                    print(f"[LIVE]   -> {d.get('label','?')} @ {d.get('confidence',0)*100:.1f}%")
                 try:
                     alert_lat = float(st.session_state.get("loc_lat", 0))
                     alert_lon = float(st.session_state.get("loc_lon", 0))
                 except (ValueError, TypeError):
                     alert_lat, alert_lon = 0.0, 0.0
                 loc_road = st.session_state.get("loc_road", "")
+                # This triggers st.warning, sound, browser notification
                 check_detections(
                     dets,
                     latitude=alert_lat,
@@ -1530,7 +1589,10 @@ if ctx.video_processor:
                     enable_sound=st.session_state.get("live_enable_sound", True),
                     enable_browser_notify=st.session_state.get("live_enable_browser", True),
                 )
-                # Clear to avoid re-processing
+                print(f"[LIVE] Alert triggered for {len(dets)} detection(s)")
+                st.warning(f"🚨 ROAD DAMAGE DETECTED: {st.session_state.get('last_damage', 'Damage')} (Confidence: {dets[0].get('confidence',0)*100:.1f}%)")
+                print(f"[LIVE] Browser notification sent")
+                print(f"[LIVE] Sound alert played")
                 st.session_state.live_new_detections = None
 
             # ── Charts Row ──
@@ -1603,6 +1665,9 @@ if ctx.video_processor:
                     yaxis=dict(showgrid=False, visible=False),
                 )
                 st.plotly_chart(trend_fig, use_container_width=True)
+
+            # Close camera-glass div
+            st.markdown("</div>", unsafe_allow_html=True)
 
         # ── SIDE PANEL ──
         with side_col:
